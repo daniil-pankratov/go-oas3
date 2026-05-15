@@ -24,6 +24,7 @@ type Config struct {
 
 	PassRawRequest    bool `config:"pass-raw-request,description=pass raw request to handler"`
 	PrioritizeXGoType bool `config:"prioritize-x-go-type,description=prioritize x-go-type declaration over schema type, if both are provided"`
+	DefaultGenerics   bool `config:"default-generics,description=emit generic response builder per operation by default (can be overridden per-operation with x-go-generics)"`
 }
 
 func (config *Config) Defaults() *Config {

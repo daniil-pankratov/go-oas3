@@ -22,6 +22,7 @@ const (
 	goOmitempty         = "x-go-omitempty"
 	goSkipValidation    = "x-go-skip-validation"
 	goSkipSecurityCheck = "x-go-skip-security-check"
+	goGenerics          = "x-go-generics"
 )
 
 // isSchemaType safely checks if schema type matches the given type string.
