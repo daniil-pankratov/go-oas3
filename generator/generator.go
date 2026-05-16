@@ -5,30 +5,157 @@ import (
 	"fmt"
 	"html"
 	"slices"
+	"strconv"
 	"strings"
 
-	"github.com/ahmetb/go-linq"
 	"github.com/dave/jennifer/jen"
 	"github.com/getkin/kin-openapi/openapi3"
-	"github.com/spf13/cast"
 	"github.com/tdewolff/minify/v2/minify"
 
 	"github.com/mikekonan/go-oas3/configurator"
 )
 
 type Generator struct {
-	normalizer *Normalizer          `di.inject:"normalizer"`
-	typee      *Type                `di.inject:"typeFiller"`
-	config     *configurator.Config `di.inject:"config"`
+	normalizer *Normalizer
+	typee      *Type
+	config     *configurator.Config
 
 	// optimize code generator for regexp
 	useRegex map[string]string
+
+	// errVars dedupes constant runtime error messages so each unique message
+	// becomes a single package-level `var ... = errors.New(...)` instead of a
+	// fresh fmt.Errorf allocation per call. Keys: errFile{Components,Routes}.
+	componentErrVars map[string]string
+	routesErrVars    map[string]string
+}
+
+type errFile int
+
+const (
+	errFileComponents errFile = iota
+	errFileRoutes
+)
+
+// errVar registers (or reuses) a package-level error variable for msg in the
+// target file and returns its identifier. Same message → same identifier.
+// When components and routes share the same Go package (the default config),
+// both files' errors are coalesced into one map so the emitted var block is
+// declared once and referenced from both files without duplicate-identifier
+// errors at compile time.
+func (generator *Generator) errVar(msg string, file errFile) string {
+	if generator.errVarsPackagesShared() {
+		file = errFileComponents
+	}
+	m := generator.errVarsMap(file)
+	if name, ok := (*m)[msg]; ok {
+		return name
+	}
+	name := buildErrVarName(msg, len(*m))
+	// Guard against name collisions across different messages that normalize
+	// to the same identifier (e.g. "x is required" vs "x_is_required").
+	for _, existing := range *m {
+		if existing == name {
+			name = fmt.Sprintf("%s%d", name, len(*m))
+			break
+		}
+	}
+	(*m)[msg] = name
+	return name
+}
+
+func (generator *Generator) errVarsPackagesShared() bool {
+	return generator.config.ComponentsPackage == generator.config.Package
+}
+
+func (generator *Generator) errVarsMap(file errFile) *map[string]string {
+	if file == errFileComponents {
+		if generator.componentErrVars == nil {
+			generator.componentErrVars = map[string]string{}
+		}
+		return &generator.componentErrVars
+	}
+	if generator.routesErrVars == nil {
+		generator.routesErrVars = map[string]string{}
+	}
+	return &generator.routesErrVars
+}
+
+// errVarsBlock emits a `var (...)` block declaring every registered package-
+// level error variable for the file in deterministic order. When components
+// and routes share a package, the routes-side block is empty — the shared
+// declarations live in components_gen.go and are visible to routes_gen.go.
+func (generator *Generator) errVarsBlock(file errFile) jen.Code {
+	if generator.errVarsPackagesShared() && file == errFileRoutes {
+		return jen.Null()
+	}
+	m := *generator.errVarsMap(file)
+	if len(m) == 0 {
+		return jen.Null()
+	}
+	type entry struct{ name, msg string }
+	entries := make([]entry, 0, len(m))
+	for msg, name := range m {
+		entries = append(entries, entry{name, msg})
+	}
+	slices.SortFunc(entries, func(a, b entry) int { return strings.Compare(a.name, b.name) })
+	defs := make([]jen.Code, 0, len(entries))
+	for _, e := range entries {
+		defs = append(defs, jen.Id(e.name).Op("=").Qual("errors", "New").Call(jen.Lit(e.msg)))
+	}
+	return jen.Var().Defs(defs...).Line()
+}
+
+// buildErrVarName turns a free-form message into a Go identifier prefixed
+// with "err". Non-alphanumeric runes act as word separators; each following
+// word is title-cased. Falls back to errN if normalization yields nothing.
+func buildErrVarName(msg string, idx int) string {
+	var sb strings.Builder
+	sb.WriteString("err")
+	titleNext := true
+	for _, r := range msg {
+		switch {
+		case r >= 'a' && r <= 'z':
+			if titleNext {
+				sb.WriteRune(r - 32)
+				titleNext = false
+			} else {
+				sb.WriteRune(r)
+			}
+		case r >= 'A' && r <= 'Z':
+			sb.WriteRune(r)
+			titleNext = false
+		case r >= '0' && r <= '9':
+			sb.WriteRune(r)
+			titleNext = false
+		default:
+			titleNext = true
+		}
+	}
+	if sb.Len() == 3 {
+		return fmt.Sprintf("err%d", idx)
+	}
+	return sb.String()
 }
 
 type Result struct {
 	ComponentsCode *jen.File
 	RouterCode     *jen.File
 	SpecCode       *jen.File
+}
+
+func New(normalizer *Normalizer, typee *Type, config *configurator.Config) *Generator {
+	return &Generator{
+		normalizer: normalizer,
+		typee:      typee,
+		config:     config,
+	}
+}
+
+func NewNormalizer() *Normalizer { return &Normalizer{} }
+
+func NewType(normalizer *Normalizer, config *configurator.Config) *Type {
+	return &Type{normalizer: normalizer, config: config}
 }
 
 // sortedMapKeys returns sorted keys from any map to ensure deterministic iteration
@@ -47,6 +174,17 @@ type sortedKeyValue[K comparable, V any] struct {
 	Value V
 }
 
+// mustParseStatusCode parses an OpenAPI status-code string (always "100"..."599")
+// into an int. The spec guarantees a valid integer string here; we panic on
+// anything else rather than silently emitting 0 into the generated code.
+func mustParseStatusCode(s string) int {
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		panic(fmt.Sprintf("status code %q is not an integer: %v", s, err))
+	}
+	return n
+}
+
 // sortedMapEntries returns sorted key-value pairs from any map to ensure deterministic iteration
 func sortedMapEntries[K ~string, V any](m map[K]V) []sortedKeyValue[K, V] {
 	keys := sortedMapKeys(m)
@@ -55,15 +193,6 @@ func sortedMapEntries[K ~string, V any](m map[K]V) []sortedKeyValue[K, V] {
 		entries[i] = sortedKeyValue[K, V]{Key: k, Value: m[k]}
 	}
 	return entries
-}
-
-// toLinqKeyValue converts sorted entries to linq KeyValue for compatibility
-func toLinqKeyValue[K comparable, V any](entries []sortedKeyValue[K, V]) []linq.KeyValue {
-	result := make([]linq.KeyValue, len(entries))
-	for i, entry := range entries {
-		result[i] = linq.KeyValue{Key: entry.Key, Value: entry.Value}
-	}
-	return result
 }
 
 func (generator *Generator) file(from jen.Code, packagePath string) *jen.File {
@@ -82,12 +211,23 @@ func (generator *Generator) file(from jen.Code, packagePath string) *jen.File {
 func (generator *Generator) Generate(swagger *openapi3.T) *Result {
 	componentsAdditionalVars, parametersAdditionalVars := generator.additionalConstants(swagger)
 
-	componentsCode := jen.Null().Add(componentsAdditionalVars, generator.components(swagger))
+	// Generate bodies first so errVar() registrations are complete before we
+	// emit the `var (...)` block of singleton error values for each file.
+	componentsBody := generator.components(swagger)
+	wrappersBody := generator.wrappers(swagger)
+	buildersBody := generator.requestResponseBuilders(swagger)
+	securityBody := generator.securitySchemas(swagger)
+
+	componentsCode := jen.Null().
+		Add(componentsAdditionalVars).
+		Add(generator.errVarsBlock(errFileComponents)).
+		Add(componentsBody)
 	routerCode := jen.Null().
 		Add(parametersAdditionalVars...).Line().
-		Add(generator.wrappers(swagger)).Line().
-		Add(generator.requestResponseBuilders(swagger)).Line().
-		Add(generator.securitySchemas(swagger))
+		Add(generator.errVarsBlock(errFileRoutes)).
+		Add(wrappersBody).Line().
+		Add(buildersBody).Line().
+		Add(securityBody)
 
 	return &Result{
 		ComponentsCode: generator.file(componentsCode, generator.config.ComponentsPackage),
@@ -97,77 +237,51 @@ func (generator *Generator) Generate(swagger *openapi3.T) *Result {
 }
 
 func (generator *Generator) requestParameters(paths map[string]*openapi3.PathItem) jen.Code {
-	var result []jen.Code
+	// For each path × method, emit one (or more, for multi-content-type)
+	// request struct. Group by tag so identically-tagged operations sit next
+	// to each other in the output. Tag order is lexical; path/method order
+	// inside a tag follows path then method.
+	codeByTag := map[string][]jen.Code{}
+	for _, pathEntry := range sortedMapEntries(paths) {
+		path := pathEntry.Key
+		for _, opEntry := range sortedMapEntries(pathEntry.Value.Operations()) {
+			operation := opEntry.Value
+			tag := generator.normalizer.normalize("default")
+			if len(operation.Tags) > 0 {
+				tag = generator.normalizer.normalize(operation.Tags[0])
+			}
 
-	linq.From(sortedMapEntries(paths)).
-		SelectManyT(func(entry sortedKeyValue[string, *openapi3.PathItem]) linq.Query {
-			path := entry.Key
-			operationsCodeTags := map[string][]jen.Code{}
+			name := generator.normalizer.normalizeOperationName(path, opEntry.Key)
 
-			linq.From(sortedMapEntries(entry.Value.Operations())).
-				GroupByT(
-					func(entry sortedKeyValue[string, *openapi3.Operation]) string {
-						var tag string
-						if len(entry.Value.Tags) > 0 {
-							tag = entry.Value.Tags[0]
-						} else {
-							tag = "default"
-						}
-						return generator.normalizer.normalize(tag)
-					},
-					func(entry sortedKeyValue[string, *openapi3.Operation]) (result []jen.Code) {
-						name := generator.normalizer.normalizeOperationName(path, entry.Key)
-						operation := entry.Value
-						if operation.RequestBody == nil {
-							result = append(result, generator.requestParameterStruct(name, "", false, operation))
-							return
-						}
+			var opCode []jen.Code
+			switch {
+			case operation.RequestBody == nil:
+				opCode = append(opCode, generator.requestParameterStruct(name, "", false, operation))
+			case len(operation.RequestBody.Value.Content) == 1:
+				contentType := sortedMapKeys(operation.RequestBody.Value.Content)[0]
+				opCode = append(opCode, generator.requestParameterStruct(name, contentType, false, operation))
+			default:
+				// One struct per content-type, separated by blank lines.
+				for _, ctEntry := range sortedMapEntries(operation.RequestBody.Value.Content) {
+					opCode = append(opCode, generator.requestParameterStruct(name, ctEntry.Key, true, operation))
+				}
+				opCode = generator.normalizer.doubleLineAfterEachElement(opCode...)
+			}
+			codeByTag[tag] = append(codeByTag[tag], opCode...)
+		}
+	}
 
-						if operation.RequestBody != nil && len(operation.RequestBody.Value.Content) == 1 {
-							contentType := sortedMapKeys(operation.RequestBody.Value.Content)[0]
-							result = append(result, generator.requestParameterStruct(name, contentType, false, operation))
-							return
-						}
+	tags := make([]string, 0, len(codeByTag))
+	for tag := range codeByTag {
+		tags = append(tags, tag)
+	}
+	slices.Sort(tags)
 
-						var contentTypeResult []jen.Code
-						linq.From(sortedMapEntries(operation.RequestBody.Value.Content)).
-							SelectT(func(entry sortedKeyValue[string, *openapi3.MediaType]) jen.Code {
-								return generator.requestParameterStruct(name, entry.Key, true, operation)
-							}).
-							ToSlice(&contentTypeResult)
-
-						result = append(result, contentTypeResult...)
-
-						result = generator.normalizer.doubleLineAfterEachElement(result...)
-
-						return
-					},
-				).
-				ToMapByT(&operationsCodeTags,
-					func(kv linq.Group) interface{} { return kv.Key },
-					func(kv linq.Group) (grouped []jen.Code) {
-						linq.From(kv.Group).SelectMany(func(i interface{}) linq.Query { return linq.From(i) }).ToSlice(&grouped)
-						return
-					},
-				)
-
-			return linq.From(operationsCodeTags)
-		}).
-		GroupByT(
-			func(kv linq.KeyValue) interface{} { return kv.Key },
-			func(kv linq.KeyValue) interface{} { return kv.Value },
-		).
-		OrderByT(func(group linq.Group) string { return cast.ToString(group.Key) }).
-		SelectT(func(kv linq.Group) jen.Code {
-			var grouped []jen.Code
-			linq.From(kv.Group).SelectMany(func(i interface{}) linq.Query { return linq.From(i) }).ToSlice(&grouped)
-			return jen.Add(generator.normalizer.lineAfterEachElement(grouped...)...)
-		}).
-		ToSlice(&result)
-
-	return jen.Null().
-		Add(result...).
-		Add(jen.Line())
+	out := jen.Null()
+	for _, tag := range tags {
+		out = out.Add(generator.normalizer.lineAfterEachElement(codeByTag[tag]...)...)
+	}
+	return out.Add(jen.Line())
 }
 
 func (generator *Generator) components(swagger *openapi3.T) jen.Code {
@@ -187,65 +301,52 @@ func (generator *Generator) components(swagger *openapi3.T) jen.Code {
 		componentsResult = append(componentsResult, generator.componentFromSchema(schemaName, schemaRef))
 	}
 
-	var componentsFromPathsResult []jen.Code
-	linq.From(sortedMapEntries(swagger.Paths.Map())).
-		SelectManyT(func(entry sortedKeyValue[string, *openapi3.PathItem]) linq.Query {
-			path := entry.Key
-			componentsByName := map[string]jen.Code{}
+	// Per-path inline request-body components: a struct gets emitted for each
+	// operation whose RequestBody has at least one inline (non-$ref) content
+	// entry. Single-content-type operations get just <Op>RequestBody; multi-
+	// content-type operations get <Op><ContentType>RequestBody for each.
+	//
+	// Keys are deduplicated by name (a single operation might appear twice via
+	// linq's previous ToMapByT semantics) — we collect into a map first, then
+	// emit in lexical order.
+	componentsByName := map[string]jen.Code{}
+	for _, pathEntry := range sortedMapEntries(swagger.Paths.Map()) {
+		path := pathEntry.Key
+		for _, opEntry := range sortedMapEntries(pathEntry.Value.Operations()) {
+			operation := opEntry.Value
+			if operation.RequestBody == nil || len(operation.RequestBody.Value.Content) == 0 {
+				continue
+			}
+			// Only process if at least one content entry is an inline schema.
+			hasInline := false
+			for _, mt := range operation.RequestBody.Value.Content {
+				if mt.Schema.Ref == "" {
+					hasInline = true
+					break
+				}
+			}
+			if !hasInline {
+				continue
+			}
 
-			linq.From(sortedMapEntries(entry.Value.Operations())).
-				WhereT(func(entry sortedKeyValue[string, *openapi3.Operation]) bool {
-					operation := entry.Value
-					return operation.RequestBody != nil && len(operation.RequestBody.Value.Content) > 0 &&
-						linq.From(sortedMapEntries(operation.RequestBody.Value.Content)).
-							AnyWithT(func(entry sortedKeyValue[string, *openapi3.MediaType]) bool { return entry.Value.Schema.Ref == "" })
-				}).
-				SelectManyT(
-					func(entry sortedKeyValue[string, *openapi3.Operation]) linq.Query {
-						result := map[string]jen.Code{}
-						name := generator.normalizer.normalizeOperationName(path, entry.Key)
-						operation := entry.Value
+			baseName := generator.normalizer.normalizeOperationName(path, opEntry.Key)
+			if len(operation.RequestBody.Value.Content) == 1 {
+				name := baseName + "RequestBody"
+				schema := sortedMapEntries(operation.RequestBody.Value.Content)[0].Value.Schema
+				componentsByName[name] = generator.componentFromSchema(name, schema)
+				continue
+			}
+			for _, ctEntry := range sortedMapEntries(operation.RequestBody.Value.Content) {
+				objName := baseName + generator.normalizer.contentType(ctEntry.Key+"RequestBody")
+				componentsByName[objName] = generator.componentFromSchema(objName, ctEntry.Value.Schema)
+			}
+		}
+	}
 
-						if len(operation.RequestBody.Value.Content) == 1 {
-							name += "RequestBody"
-							obj := sortedMapEntries(operation.RequestBody.Value.Content)[0].Value
-
-							result[name] = generator.componentFromSchema(name, obj.Schema)
-							return linq.From(toLinqKeyValue(sortedMapEntries(result)))
-						}
-
-						linq.From(sortedMapEntries(operation.RequestBody.Value.Content)).
-							ToMapByT(&result,
-								func(entry sortedKeyValue[string, *openapi3.MediaType]) string {
-									return name + generator.normalizer.contentType(entry.Key+"RequestBody")
-								},
-								func(entry sortedKeyValue[string, *openapi3.MediaType]) jen.Code {
-									meType := entry.Value
-
-									objName := name + generator.normalizer.contentType(entry.Key+"RequestBody")
-									return generator.componentFromSchema(objName, meType.Schema)
-								})
-
-						return linq.From(toLinqKeyValue(sortedMapEntries(result)))
-					},
-				).
-				ToMapByT(&componentsByName,
-					func(entry sortedKeyValue[string, jen.Code]) interface{} { return entry.Key },
-					func(entry sortedKeyValue[string, jen.Code]) interface{} { return entry.Value })
-
-			return linq.From(toLinqKeyValue(sortedMapEntries(componentsByName)))
-		}).
-		GroupByT(
-			func(kv linq.KeyValue) interface{} { return kv.Key },
-			func(kv linq.KeyValue) interface{} { return kv.Value },
-		).
-		OrderByT(func(group linq.Group) string { return cast.ToString(group.Key) }).
-		SelectT(func(kv linq.Group) jen.Code {
-			var grouped []jen.Code
-			linq.From(kv.Group).ToSlice(&grouped)
-			return jen.Add(generator.normalizer.doubleLineAfterEachElement(grouped...)...)
-		}).
-		ToSlice(&componentsFromPathsResult)
+	componentsFromPathsResult := make([]jen.Code, 0, len(componentsByName))
+	for _, entry := range sortedMapEntries(componentsByName) {
+		componentsFromPathsResult = append(componentsFromPathsResult, entry.Value)
+	}
 
 	// Add inline response body components
 	var inlineResponseComponents []jen.Code
@@ -465,129 +566,99 @@ func (generator *Generator) requestParameterStruct(name string, contentType stri
 			parameter{In: "Body", Code: jen.Id("Body").Qual(generator.config.ComponentsPackage, bodyTypeName)})
 	}
 
-	var parameterStructs []jen.Code
+	// Group parameters by `in` (header/path/query/cookie), keep parameter
+	// names sorted within each group. Emit one Request<In> struct per group
+	// (with field + Get<Field>() accessors + Validate()).
+	paramsByIn := map[string][]*openapi3.ParameterRef{}
+	for _, p := range operation.Parameters {
+		paramsByIn[p.Value.In] = append(paramsByIn[p.Value.In], p)
+	}
+	ins := make([]string, 0, len(paramsByIn))
+	for in := range paramsByIn {
+		ins = append(ins, in)
+	}
+	slices.Sort(ins)
+	for _, group := range paramsByIn {
+		slices.SortFunc(group, func(a, b *openapi3.ParameterRef) int {
+			return strings.Compare(a.Value.Name, b.Value.Name)
+		})
+	}
 
-	linq.From(operation.Parameters).
-		GroupByT(
-			func(parameter *openapi3.ParameterRef) string { return parameter.Value.In },
-			func(parameter *openapi3.ParameterRef) *openapi3.ParameterRef { return parameter }).
-		OrderByT(func(group linq.Group) string { return cast.ToString(group.Key) }).
-		SelectT(
-			func(group linq.Group) jen.Code {
-				var structFields []jen.Code
-				linq.From(group.Group).
-					OrderByT(func(parameter *openapi3.ParameterRef) string { return parameter.Value.Name }).
-					SelectT(func(parameter *openapi3.ParameterRef) (result jen.Code) {
-						name := generator.normalizer.normalize(parameter.Value.Name)
-						var statement = jen.Id(name)
+	parameterStructs := make([]jen.Code, 0, len(ins))
+	for _, in := range ins {
+		group := paramsByIn[in]
+		typeName := name + "Request" + strings.Title(in)
 
-						if len(parameter.Value.Schema.Value.Enum) > 0 {
-							if len(parameter.Value.Schema.Ref) > 0 {
-								generator.typee.fillGoType(statement, "", generator.normalizer.extractNameFromRef(parameter.Value.Schema.Ref), parameter.Value.Schema, false, false)
-								return statement
-							}
+		structFields := make([]jen.Code, 0, len(group))
+		getters := make([]jen.Code, 0, len(group))
+		var fieldValidationRules []jen.Code
 
-							//todo: generate enum for anonymous type
-						}
+		for _, parameter := range group {
+			pName := generator.normalizer.normalize(parameter.Value.Name)
 
-						generator.typee.fillGoType(statement, "", name, parameter.Value.Schema, false, false)
+			// Struct field.
+			field := jen.Id(pName)
+			if len(parameter.Value.Schema.Value.Enum) > 0 && len(parameter.Value.Schema.Ref) > 0 {
+				generator.typee.fillGoType(field, "", generator.normalizer.extractNameFromRef(parameter.Value.Schema.Ref), parameter.Value.Schema, false, false)
+			} else {
+				generator.typee.fillGoType(field, "", pName, parameter.Value.Schema, false, false)
+				// Header field needs a json tag so ozzo-validation surfaces the
+				// real on-wire header name in error messages.
+				if parameter.Value.In == "header" {
+					generator.typee.fillJsonTag(field, parameter.Value.Schema, parameter.Value.Name)
+				}
+			}
+			structFields = append(structFields, field)
 
-						// add fill json tag for ozzo validation.
-						// Parameters:
-						//    in: header
-						//    name: my-header
-						// example: struct RequestHeader { MyHeader string }.Validate() err with msg: MyHeader invalid (but real header name is my-header)
-						// example: struct RequestHeader { MyHeader string `json:"my-header"` }.Validate() err with msg: my-header invalid (real header name is equal name in err msg)
-						if parameter.Value.In == "header" {
-							generator.typee.fillJsonTag(statement, parameter.Value.Schema, parameter.Value.Name)
-						}
-						return statement
-					}).
-					ToSlice(&structFields)
+			// Getter.
+			fvRule := generator.fieldValidationRuleFromSchema(parameter.Value.In, pName, parameter.Value.Schema, parameter.Value.Required)
+			if fvRule != nil {
+				fieldValidationRules = append(fieldValidationRules, jen.Line().Add(fvRule))
+			}
 
-				var getters []jen.Code
+			getter := jen.Func().Params(jen.Id(parameter.Value.In).Id(typeName)).Id("Get" + pName).Params()
+			returnType := jen.Null()
+			if len(parameter.Value.Schema.Value.Enum) > 0 && len(parameter.Value.Schema.Ref) > 0 {
+				generator.typee.fillGoType(returnType, "", generator.normalizer.extractNameFromRef(parameter.Value.Schema.Ref), parameter.Value.Schema, false, false)
+			} else {
+				generator.typee.fillGoType(returnType, "", pName, parameter.Value.Schema, false, false)
+			}
+			getter = getter.Params(returnType).Block(jen.Return().Id(parameter.Value.In).Dot(pName))
+			getters = append(getters, getter)
+		}
 
-				typeName := name + "Request" + strings.Title(cast.ToString(group.Key))
+		validateFunc := generator.validationFuncFromRules(in, typeName, fieldValidationRules, nil)
+		parameterStructs = append(parameterStructs,
+			jen.Type().Id(typeName).Struct(structFields...).
+				Line().Line().
+				Add(generator.normalizer.doubleLineAfterEachElement(getters...)...).
+				Add(validateFunc))
+	}
 
-				var fieldValidationRules []jen.Code
+	// Build the outer request struct's fields (one per `in` group, plus the
+	// Body field for content-type operations), sorted by `in` (alphabetical)
+	// so the layout matches the original linq output.
+	type inField struct {
+		in   string
+		code jen.Code
+	}
+	allFields := make([]inField, 0, len(ins)+len(additionalParameters))
+	for _, in := range ins {
+		title := strings.Title(in)
+		allFields = append(allFields, inField{
+			in:   in,
+			code: jen.Id(title).Id(name + "Request" + title),
+		})
+	}
+	for _, ap := range additionalParameters {
+		allFields = append(allFields, inField{in: ap.In, code: ap.Code})
+	}
+	slices.SortFunc(allFields, func(a, b inField) int { return strings.Compare(a.in, b.in) })
 
-				linq.From(group.Group).
-					OrderByT(func(parameter *openapi3.ParameterRef) string { return parameter.Value.Name }).
-					SelectT(func(parameter *openapi3.ParameterRef) (result jen.Code) {
-						name := generator.normalizer.normalize(parameter.Value.Name)
-						var statement = jen.Func().Params(jen.Id(parameter.Value.In).Id(typeName)).Id("Get" + name).Params()
-
-						fvRule := generator.fieldValidationRuleFromSchema(parameter.Value.In, name, parameter.Value.Schema, parameter.Value.Required)
-						if fvRule != nil {
-							fieldValidationRules = append(fieldValidationRules, jen.Line().Add(fvRule))
-						}
-
-						if len(parameter.Value.Schema.Value.Enum) > 0 {
-							if len(parameter.Value.Schema.Ref) > 0 {
-								var returnType = jen.Null()
-								generator.typee.fillGoType(returnType, "", generator.normalizer.extractNameFromRef(parameter.Value.Schema.Ref), parameter.Value.Schema, false, false)
-								statement = statement.Params(returnType).Block(jen.Return().Id(parameter.Value.In).Dot(name))
-								return statement
-							}
-
-							//todo: generate enum for anonymous type
-						}
-
-						var returnType = jen.Null()
-						generator.typee.fillGoType(returnType, "", name, parameter.Value.Schema, false, false)
-						statement = statement.Params(returnType).Block(jen.Return().Id(parameter.Value.In).Dot(name))
-						return statement
-					}).
-					ToSlice(&getters)
-
-				validateFunc := generator.validationFuncFromRules(cast.ToString(group.Key), typeName, fieldValidationRules, nil)
-
-				return jen.Type().Id(typeName).Struct(structFields...).
-					Line().Line().
-					Add(generator.normalizer.doubleLineAfterEachElement(getters...)...).
-					Add(validateFunc)
-			}).
-		ToSlice(&parameterStructs)
-
-	var parameters []jen.Code
-
-	linq.From(operation.Parameters).
-		GroupByT(
-			func(parameter *openapi3.ParameterRef) string { return parameter.Value.In },
-			func(parameter *openapi3.ParameterRef) *openapi3.ParameterRef { return parameter }).
-		OrderByT(func(group linq.Group) string { return cast.ToString(group.Key) }).
-		SelectT(
-			func(group linq.Group) (parameter parameter) {
-				var structFields []jen.Code
-				linq.From(group.Group).
-					OrderByT(func(parameter *openapi3.ParameterRef) string { return parameter.Value.Name }).
-					SelectT(func(parameter *openapi3.ParameterRef) (result jen.Code) {
-						name := generator.normalizer.normalize(parameter.Value.Name)
-						var statement = jen.Id(name)
-
-						if len(parameter.Value.Schema.Value.Enum) > 0 {
-							if len(parameter.Value.Schema.Ref) > 0 {
-								generator.typee.fillGoType(statement, "", generator.normalizer.extractNameFromRef(parameter.Value.Schema.Ref), parameter.Value.Schema, false, false)
-								return statement
-							}
-
-							//todo: generate enum for anonymous type
-						}
-
-						generator.typee.fillGoType(statement, "", name, parameter.Value.Schema, false, false)
-						return statement
-					}).
-					ToSlice(&structFields)
-
-				parameter.In = cast.ToString(group.Key)
-				parameter.Code = jen.Id(strings.Title(cast.ToString(group.Key))).Id(name + "Request" + strings.Title(cast.ToString(group.Key)))
-
-				return
-			}).
-		Concat(linq.From(additionalParameters)).
-		OrderByT(func(parameter parameter) string { return parameter.In }).
-		SelectT(func(parameter parameter) jen.Code { return parameter.Code }).
-		ToSlice(&parameters)
+	parameters := make([]jen.Code, 0, len(allFields))
+	for _, f := range allFields {
+		parameters = append(parameters, f.code)
+	}
 
 	useGen := generator.useGenerics(operation)
 	hasSecuritySchemas := operation.Security != nil && len(*operation.Security) > 0
@@ -654,19 +725,16 @@ func (generator *Generator) enumFromSchema(name string, schema *openapi3.SchemaR
 	}
 
 	var result []jen.Code
-	var enumValues []jen.Code
-
 	result = append(result, jen.Type().Id(generator.normalizer.normalize(name)).String())
 
-	linq.From(schema.Value.Enum).SelectT(func(value string) jen.Code {
-		return jen.Var().Id(name + generator.normalizer.normalize(strings.Title(value))).Id(name).Op("=").Lit(value)
-	}).ToSlice(&enumValues)
-
-	var enumSwitchCases []jen.Code
-
-	linq.From(schema.Value.Enum).SelectT(func(value string) jen.Code {
-		return jen.Id(name + generator.normalizer.normalize(strings.Title(value)))
-	}).ToSlice(&enumSwitchCases)
+	enumValues := make([]jen.Code, 0, len(schema.Value.Enum))
+	enumSwitchCases := make([]jen.Code, 0, len(schema.Value.Enum))
+	for _, raw := range schema.Value.Enum {
+		value := raw.(string)
+		valName := name + generator.normalizer.normalize(strings.Title(value))
+		enumValues = append(enumValues, jen.Var().Id(valName).Id(name).Op("=").Lit(value))
+		enumSwitchCases = append(enumSwitchCases, jen.Id(valName))
+	}
 
 	result = append(result, enumValues...)
 
@@ -676,8 +744,7 @@ func (generator *Generator) enumFromSchema(name string, schema *openapi3.SchemaR
 		jen.Switch(jen.Id("enum")).Block(
 			jen.Case(enumSwitchCases...).Block(
 				jen.Line().Return().Id("nil"))),
-		jen.Line().Return().Qual("fmt",
-			"Errorf").Call(jen.Lit(fmt.Sprintf("invalid %s enum value", name))),
+		jen.Line().Return().Id(generator.errVar(fmt.Sprintf("invalid %s enum value", name), errFileComponents)),
 	).Add(jen.Line()))
 
 	result = append(result, jen.Func().Params(
@@ -780,7 +847,7 @@ func (generator *Generator) fieldValidationRuleFromSchema(receiverName string, p
 			if v.ExclusiveMax {
 				r.Dot("Exclusive").Call()
 			}
-			rules = append(rules)
+			rules = append(rules, r)
 		}
 		if len(rules) > 0 {
 			params := append([]jen.Code{jen.Op("&").Id(receiverName).Dot(propertyName)}, rules...)
@@ -839,11 +906,10 @@ func (generator *Generator) componentFromSchema(name string, parentSchema *opena
 		regex := generator.getXGoRegex(schema)
 		if regex != "" {
 			regexVarName := generator.useRegex[regex]
-			//regexVarName := generator.normalizer.decapitalize(name) + strings.Title(property) + "Regex"
+			errMsg := fmt.Sprintf(`%s not matched by the '%s' regex`, property, html.EscapeString(regex))
 			additionalValidationCode = append(additionalValidationCode,
 				jen.If(jen.Op("!").Id(regexVarName).Dot("MatchString").Call(jen.Id("body").Dot(propertyName))).Block(
-					jen.Return().Qual("fmt",
-						"Errorf").Call(jen.Lit(fmt.Sprintf(`%s not matched by the '%s' regex`, property, html.EscapeString(regex))))).Line())
+					jen.Return().Id(generator.errVar(errMsg, errFileComponents))).Line())
 		}
 
 		fvRule := generator.fieldValidationRuleFromSchema("body", propertyName, schema, false)
@@ -881,11 +947,11 @@ func (generator *Generator) componentFromSchema(name string, parentSchema *opena
 		var additionalValidationCode []jen.Code
 		regex := generator.getXGoRegex(schema)
 		if regex != "" {
-			regexVarName := generator.useRegex[regex] //normalizer.decapitalize(name) + strings.Title(property) + "Regex"
+			regexVarName := generator.useRegex[regex]
+			errMsg := fmt.Sprintf(`%s not matched by the '%s' regex`, property, html.EscapeString(regex))
 			additionalValidationCode = append(additionalValidationCode,
 				jen.If(jen.Op("!").Id(regexVarName).Dot("MatchString").Call(jen.Op("*").Id("value").Dot(propertyName))).Block(
-					jen.Return().Qual("fmt",
-						"Errorf").Call(jen.Lit(fmt.Sprintf(`%s not matched by the '%s' regex`, property, html.EscapeString(regex))))).Line())
+					jen.Return().Id(generator.errVar(errMsg, errFileComponents))).Line())
 		}
 
 		fvRule := generator.fieldValidationRuleFromSchema("body", propertyName, schema, true)
@@ -894,7 +960,7 @@ func (generator *Generator) componentFromSchema(name string, parentSchema *opena
 		}
 
 		code := jen.If(jen.Id("value").Dot(propertyName).Op("==").Id("nil")).
-			Block(jen.Return().Qual("fmt", "Errorf").Call(jen.Lit(fmt.Sprintf("%s is required", property)))).
+			Block(jen.Return().Id(generator.errVar(fmt.Sprintf("%s is required", property), errFileComponents))).
 			Line().Line().
 			Add(additionalValidationCode...).
 			Line().Line()
@@ -1236,7 +1302,10 @@ func (generator *Generator) requestProcessingResultType() jen.Code {
 	return jen.Type().Id("requestProcessingResultType").Id("uint8").
 		Add(jen.Line(), jen.Line()).
 		Add(jen.Const().Defs(
-			jen.Id("BodyUnmarshalFailed").Id("requestProcessingResultType").Op("=").Id("iota").Op("+").Lit(1),
+			// ParseSucceed is the zero value so a freshly-returned request
+			// doesn't need an explicit assignment in the parser.
+			jen.Id("ParseSucceed").Id("requestProcessingResultType").Op("=").Id("iota"),
+			jen.Id("BodyUnmarshalFailed"),
 			jen.Id("BodyValidationFailed"),
 			jen.Id("HeaderParseFailed"),
 			jen.Id("HeaderValidationFailed"),
@@ -1246,7 +1315,6 @@ func (generator *Generator) requestProcessingResultType() jen.Code {
 			jen.Id("PathValidationFailed"),
 			jen.Id("SecurityParseFailed"),
 			jen.Id("SecurityCheckFailed"),
-			jen.Id("ParseSucceed"),
 		)).
 		Add(jen.Line(), jen.Line()).
 		Add(jen.Type().Id("RequestProcessingResult").Struct(
@@ -1290,79 +1358,73 @@ func (generator *Generator) wrappers(swagger *openapi3.T) jen.Code {
 		return 0
 	})
 
-	linq.From(groupedOps).
-		SelectT(func(groupedOperations groupedOperations) jen.Code {
-			tag := generator.normalizer.normalize(cast.ToString(groupedOperations.tag))
+	for _, group := range groupedOps {
+		tag := generator.normalizer.normalize(group.tag)
+		routerName := strings.ToLower(tag) + "Router"
 
-			var routes []jen.Code
-			linq.From(groupedOperations.operations).
-				SelectT(func(operation operationWithPath) jen.Code {
-					method := generator.normalizer.normalize(strings.Title(strings.ToLower(cast.ToString(operation.method))))
+		routes := make([]jen.Code, 0, len(group.operations))
+		wrappers := make([]jen.Code, 0, len(group.operations))
+		hasSecuritySchemas := false
 
-					if operation.operation.RequestBody == nil || len(operation.operation.RequestBody.Value.Content) == 1 {
-						name := generator.normalizer.normalizeOperationName(operation.path, cast.ToString(operation.method))
-						return jen.Id("router").Dot("router").Dot(method).Call(jen.Lit(operation.path), jen.Id("router").Dot(name))
-					}
+		for _, op := range group.operations {
+			method := generator.normalizer.normalize(strings.Title(strings.ToLower(op.method)))
+			baseName := generator.normalizer.normalizeOperationName(op.path, op.method)
 
-					var result []jen.Code
-					linq.From(toLinqKeyValue(sortedMapEntries(operation.operation.RequestBody.Value.Content))).
-						SelectT(func(kv linq.KeyValue) jen.Code {
-							name := generator.normalizer.normalizeOperationName(operation.path, cast.ToString(operation.method)) + generator.normalizer.contentType(cast.ToString(kv.Key))
-							return jen.Id("router").Dot("router").Dot(method).Call(jen.Lit(operation.path), jen.Id("router").Dot(name))
-						}).ToSlice(&result)
+			// Routes: one mount line per (operation × content-type), except
+			// when there's at most one content-type, which uses the unqualified
+			// operation name.
+			if op.operation.RequestBody == nil || len(op.operation.RequestBody.Value.Content) == 1 {
+				routes = append(routes,
+					jen.Id("router").Dot("router").Dot(method).Call(jen.Lit(op.path), jen.Id("router").Dot(baseName)))
+			} else {
+				var routeCodes []jen.Code
+				for _, ctEntry := range sortedMapEntries(op.operation.RequestBody.Value.Content) {
+					name := baseName + generator.normalizer.contentType(ctEntry.Key)
+					routeCodes = append(routeCodes,
+						jen.Id("router").Dot("router").Dot(method).Call(jen.Lit(op.path), jen.Id("router").Dot(name)))
+				}
+				routes = append(routes, jen.Add(generator.normalizer.lineAfterEachElement(routeCodes...)...))
+			}
 
-					return jen.Add(generator.normalizer.lineAfterEachElement(result...)...)
-				}).ToSlice(&routes)
+			// Wrappers: one per (operation × content-type).
+			if op.operation.RequestBody == nil {
+				wrappers = append(wrappers,
+					generator.wrapper(baseName, baseName+"Request", routerName, method, op.path, op.operation, nil, ""))
+			} else if len(op.operation.RequestBody.Value.Content) == 1 {
+				// Pick the single content-type entry deterministically.
+				entries := sortedMapEntries(op.operation.RequestBody.Value.Content)
+				contentType := entries[0].Key
+				requestBody := entries[0].Value.Schema
+				wrappers = append(wrappers,
+					generator.wrapper(baseName, baseName+"Request", routerName, method, op.path, op.operation, requestBody, contentType))
+			} else {
+				var wrapperCodes []jen.Code
+				// Original behaviour iterated Content map non-deterministically;
+				// keep semantics but iterate sorted for stable output.
+				for _, ctEntry := range sortedMapEntries(op.operation.RequestBody.Value.Content) {
+					name := baseName + generator.normalizer.contentType(ctEntry.Key)
+					wrapperCodes = append(wrapperCodes,
+						generator.wrapper(name, name+"Request", routerName, method, op.path, op.operation, ctEntry.Value.Schema, ctEntry.Key))
+				}
+				wrappers = append(wrappers, jen.Add(generator.normalizer.lineAfterEachElement(wrapperCodes...)...))
+			}
 
-			var wrappers []jen.Code
+			if op.operation.Security != nil && len(*op.operation.Security) > 0 {
+				hasSecuritySchemas = true
+			}
+		}
 
-			linq.From(groupedOperations.operations).
-				SelectT(func(operation operationWithPath) jen.Code {
-					method := generator.normalizer.normalize(strings.Title(strings.ToLower(cast.ToString(operation.method))))
-					routerName := strings.ToLower(tag) + "Router"
-
-					if operation.operation.RequestBody == nil {
-						name := generator.normalizer.normalizeOperationName(operation.path, cast.ToString(operation.method))
-						requestName := name + "Request"
-						return generator.wrapper(name, requestName, routerName, method, operation.path, operation.operation, nil, "")
-					}
-					if len(operation.operation.RequestBody.Value.Content) == 1 {
-						name := generator.normalizer.normalizeOperationName(operation.path, cast.ToString(operation.method))
-						requestName := name + "Request"
-						requestBody := linq.From(operation.operation.RequestBody.Value.Content).SelectT(func(kv linq.KeyValue) interface{} { return kv.Value }).First().(*openapi3.MediaType).Schema
-						contentType := linq.From(operation.operation.RequestBody.Value.Content).SelectT(func(kv linq.KeyValue) interface{} { return kv.Key }).First().(string)
-						return generator.wrapper(name, requestName, routerName, method, operation.path, operation.operation, requestBody, contentType)
-					}
-
-					var result []jen.Code
-					linq.From(operation.operation.RequestBody.Value.Content).
-						SelectT(func(kv linq.KeyValue) interface{} {
-							name := generator.normalizer.normalizeOperationName(operation.path, cast.ToString(operation.method)) + generator.normalizer.contentType(cast.ToString(kv.Key))
-							requestName := name + "Request"
-							requestBody := operation.operation.RequestBody.Value.Content[cast.ToString(kv.Key)].Schema
-							return generator.wrapper(name, requestName, routerName, method, operation.path, operation.operation, requestBody, cast.ToString(kv.Key))
-						}).
-						ToSlice(&result)
-
-					return jen.Add(generator.normalizer.lineAfterEachElement(result...)...)
-				}).ToSlice(&wrappers)
-
-			hasSecuritySchemas := linq.From(groupedOperations.operations).
-				AnyWithT(func(operation operationWithPath) bool {
-					return operation.operation.Security != nil && len(*operation.operation.Security) > 0
-				})
-
-			return jen.Null().
-				Add(generator.handler(strings.Title(tag)+"Handler", strings.Title(tag)+"Service", strings.ToLower(tag)+"Router", hasSecuritySchemas, groupedOperations.operations)).
-				Add(jen.Line()).
-				Add(generator.router(strings.ToLower(tag)+"Router", strings.Title(tag)+"Service", hasSecuritySchemas)).
-				Add(jen.Line()).
-				Add(jen.Func().Params(jen.Id("router").Op("*").Id(strings.ToLower(tag)+"Router")).Id("mount").Params().Block(routes...)).
-				Add(jen.Line(), jen.Line()).
-				Add(generator.normalizer.lineAfterEachElement(wrappers...)...).
-				Add(jen.Line())
-
-		}).ToSlice(&results)
+		groupCode := jen.Null().
+			Add(generator.handler(strings.Title(tag)+"Handler", strings.Title(tag)+"Service", routerName, hasSecuritySchemas, group.operations)).
+			Add(jen.Line()).
+			Add(generator.router(routerName, strings.Title(tag)+"Service", hasSecuritySchemas, group.operations)).
+			Add(jen.Line()).
+			Add(jen.Func().Params(jen.Id("router").Op("*").Id(routerName)).Id("mount").Params().Block(routes...)).
+			Add(jen.Line(), jen.Line()).
+			Add(generator.normalizer.lineAfterEachElement(wrappers...)...).
+			Add(jen.Line())
+		results = append(results, groupCode)
+	}
 
 	// Generate cloneWithBody helper function when PassRawRequest is enabled
 	// This function clones the request while preserving the body for both
@@ -1575,15 +1637,38 @@ func (generator *Generator) wrapper(name string, requestName string, routerName,
 		)
 	}
 
-	hasContent := operation.Responses != nil && operation.Responses.Len() > 0 && linq.From(operation.Responses.Map()).AnyWithT(func(kv linq.KeyValue) bool { return len(kv.Value.(*openapi3.ResponseRef).Value.Content) > 0 })
+	hasContent := false
+	if operation.Responses != nil && operation.Responses.Len() > 0 {
+		for _, respRef := range operation.Responses.Map() {
+			if len(respRef.Value.Content) > 0 {
+				hasContent = true
+				break
+			}
+		}
+	}
 
+	// Bind the service result to a local so we can extract *response without
+	// going through responseInterface.statusCode()/body()/... (those methods
+	// no longer exist — respond reads fields directly). For generic mode we
+	// can take &result.response; for classic mode the service returns an
+	// interface, so we call inner() once.
+	funcCode = append(funcCode,
+		jen.Id("result").Op(":=").
+			Id("router").Dot("service").Dot(name).Call(generator.serviceCallParams(name)...),
+	)
+	var respArg jen.Code
+	if generator.useGenerics(operation) {
+		respArg = jen.Op("&").Id("result").Dot("response")
+	} else {
+		respArg = jen.Id("result").Dot("inner").Call()
+	}
 	funcCode = append(funcCode,
 		jen.Id("respond").Call(
 			jen.Id("w"),
 			jen.Id("r"),
 			jen.Id("router").Dot("hooks"),
 			jen.Lit(name),
-			jen.Id("router").Dot("service").Dot(name).Call(generator.serviceCallParams(name)...),
+			respArg,
 			jen.Lit(hasContent),
 		),
 	)
@@ -1610,45 +1695,34 @@ type operationWithPath struct {
 }
 
 func (generator *Generator) groupedOperations(swagger *openapi3.T) []groupedOperations {
-	var result []groupedOperations
-
-	linq.From(sortedMapEntries(swagger.Paths.Map())).
-		SelectManyT(func(entry sortedKeyValue[string, *openapi3.PathItem]) linq.Query {
-			path := entry.Key
-
-			return linq.From(sortedMapEntries(entry.Value.Operations())).
-				SelectT(func(entry sortedKeyValue[string, *openapi3.Operation]) groupedOperations {
-					operation := entry.Value
-					var tag string
-					if len(operation.Tags) > 0 {
-						tag = operation.Tags[0]
-					} else {
-						tag = "default" // Provide a default tag when none is specified
-					}
-
-					return groupedOperations{
-						tag:        tag,
-						operations: []operationWithPath{{operation: operation, path: path, method: entry.Key}},
-					}
-				})
-		}).
-		GroupByT(
-			func(wrapper groupedOperations) string { return wrapper.tag },
-			func(wrapper groupedOperations) groupedOperations { return wrapper }).
-		OrderByT(func(group linq.Group) string { return cast.ToString(group.Key) }).
-		SelectT(func(group linq.Group) groupedOperations {
-			var operations []operationWithPath
-
-			linq.From(group.Group).
-				SelectT(func(wrapper groupedOperations) operationWithPath { return wrapper.operations[0] }).ToSlice(&operations)
-
-			return groupedOperations{
-				tag:        cast.ToString(group.Key),
-				operations: operations,
+	// Walk paths (sorted) → operations (sorted) and bucket by primary tag.
+	// "default" stands in for operations without a tag.
+	byTag := map[string][]operationWithPath{}
+	for _, pathEntry := range sortedMapEntries(swagger.Paths.Map()) {
+		for _, opEntry := range sortedMapEntries(pathEntry.Value.Operations()) {
+			operation := opEntry.Value
+			tag := "default"
+			if len(operation.Tags) > 0 {
+				tag = operation.Tags[0]
 			}
-		}).
-		ToSlice(&result)
+			byTag[tag] = append(byTag[tag], operationWithPath{
+				operation: operation,
+				path:      pathEntry.Key,
+				method:    opEntry.Key,
+			})
+		}
+	}
 
+	tags := make([]string, 0, len(byTag))
+	for tag := range byTag {
+		tags = append(tags, tag)
+	}
+	slices.Sort(tags)
+
+	result := make([]groupedOperations, 0, len(tags))
+	for _, tag := range tags {
+		result = append(result, groupedOperations{tag: tag, operations: byTag[tag]})
+	}
 	return result
 }
 
@@ -1658,29 +1732,37 @@ func (generator *Generator) handler(name string, serviceName string, routerName 
 	if hasSchemas {
 		schemasInterfaceParameter = schemasInterfaceParameter.Id("securitySchemas").Id("SecuritySchemas")
 
-		var declarations []jen.Code
-
-		linq.From(operations).
-			SelectManyT(func(operation operationWithPath) linq.Query {
-				if operation.operation.Security == nil {
-					return linq.From([]openapi3.SecurityRequirement{})
+		// Collect distinct security scheme names across all operations,
+		// sorted for deterministic codegen.
+		seen := map[string]struct{}{}
+		var names []string
+		for _, op := range operations {
+			if op.operation.Security == nil {
+				continue
+			}
+			for _, req := range *op.operation.Security {
+				for k := range req {
+					if _, ok := seen[k]; ok {
+						continue
+					}
+					seen[k] = struct{}{}
+					names = append(names, k)
 				}
+			}
+		}
+		slices.Sort(names)
 
-				return linq.From(*operation.operation.Security)
-			}).
-			SelectManyT(func(securityRequirement openapi3.SecurityRequirement) linq.Query {
-				return linq.From(securityRequirement).SelectT(func(kv linq.KeyValue) interface{} { return kv.Key })
-			}).
-			Distinct().
-			SelectT(func(name string) jen.Code {
-				name = strings.Title(name)
-
-				return jen.Line().Id("SecurityScheme"+name).Op(":").Values(jen.Line().Id("scheme").Op(":").Id("SecurityScheme"+name),
-					jen.Line().Id("extract").Op(":").Id("securityExtractorsFuncs").Index(jen.Id("SecurityScheme"+name)),
-					jen.Line().Id("handle").Op(":").Id("securitySchemas").Dot("SecurityScheme"+name),
+		declarations := make([]jen.Code, 0, len(names)+1)
+		for _, raw := range names {
+			n := strings.Title(raw)
+			declarations = append(declarations,
+				jen.Line().Id("SecurityScheme"+n).Op(":").Values(
+					jen.Line().Id("scheme").Op(":").Id("SecurityScheme"+n),
+					jen.Line().Id("extract").Op(":").Id("securityExtractorsFuncs").Index(jen.Id("SecurityScheme"+n)),
+					jen.Line().Id("handle").Op(":").Id("securitySchemas").Dot("SecurityScheme"+n),
 					jen.Line(),
-				)
-			}).ToSlice(&declarations)
+				))
+		}
 
 		declarations = append(declarations, jen.Line())
 
@@ -1688,97 +1770,176 @@ func (generator *Generator) handler(name string, serviceName string, routerName 
 			Values(declarations...)
 	}
 
+	// Per-op [][]securityProcessor — built once now so the hot path doesn't
+	// allocate the outer/inner slice literal on every request.
+	var securityReqsInits []jen.Code
+	if hasSchemas {
+		// Sort operations for deterministic output.
+		ops := append([]operationWithPath(nil), operations...)
+		slices.SortFunc(ops, func(a, b operationWithPath) int {
+			if a.path != b.path {
+				return strings.Compare(a.path, b.path)
+			}
+			return strings.Compare(a.method, b.method)
+		})
+		for _, op := range ops {
+			if op.operation.Security == nil || len(*op.operation.Security) == 0 {
+				continue
+			}
+			opName := generator.normalizer.normalizeOperationName(op.path, op.method)
+
+			// Build the literal: [][]securityProcessor{{router.securityHandlers[X], ...}, ...}.
+			var reqValues []jen.Code
+			for _, requirement := range *op.operation.Security {
+				var handlerLookups []jen.Code
+				// Deterministic key order within a SecurityRequirement.
+				keys := make([]string, 0, len(requirement))
+				for k := range requirement {
+					keys = append(keys, k)
+				}
+				slices.Sort(keys)
+				for _, k := range keys {
+					handlerLookups = append(handlerLookups, jen.Id("router").Dot("securityHandlers").Index(jen.Id("SecurityScheme"+strings.Title(k))))
+				}
+				reqValues = append(reqValues, jen.Values(handlerLookups...))
+			}
+
+			securityReqsInits = append(securityReqsInits,
+				jen.Line().Id("router").Dot(generator.securityReqsFieldName(opName)).Op("=").
+					Index().Index().Id("securityProcessor").Values(reqValues...))
+		}
+	}
+
+	body := []jen.Code{
+		jen.Id("hooks").Op("=").Id("ensureHooks").Call(jen.Id("hooks")),
+		jen.Line().Id("router").Op(":=").Op("&").Id(routerName).Values(jen.Id("router").Op(":").Id("r"),
+			jen.Id("service").Op(":").Id("impl"), jen.Id("hooks").Op(":").Id("hooks")),
+		schemas,
+	}
+	body = append(body, securityReqsInits...)
+	body = append(body,
+		jen.Line().Id("router").Dot("mount").Call(),
+		jen.Line().Return().Id("router").Dot("router"),
+	)
+
 	code := jen.Func().Id(name).
 		Params(
 			jen.Id("impl").Id(serviceName),
 			jen.Id("r").Qual("github.com/go-chi/chi/v5", "Router"),
 			jen.Id("hooks").Op("*").Id("Hooks"), schemasInterfaceParameter).
 		Params(jen.Qual("net/http", "Handler")).
-		Block(
-			jen.Id("hooks").Op("=").Id("ensureHooks").Call(jen.Id("hooks")),
-			jen.Line().Id("router").Op(":=").Op("&").Id(routerName).Values(jen.Id("router").Op(":").Id("r"),
-				jen.Id("service").Op(":").Id("impl"), jen.Id("hooks").Op(":").Id("hooks")),
-			schemas,
-			jen.Line().Id("router").Dot("mount").Call(),
-			jen.Line().Return().Id("router").Dot("router"),
-		)
+		Block(body...)
 
 	return code
 }
 
-func (generator *Generator) router(routerName string, serviceName string, hasSecuritySchemas bool) jen.Code {
-	securityHandlers := jen.Null()
-	if hasSecuritySchemas {
-		securityHandlers = securityHandlers.Id("securityHandlers").Map(jen.Id("SecurityScheme")).Id("securityProcessor")
-	}
+// securityReqsFieldName returns the per-operation router field that holds
+// the pre-built [][]securityProcessor for an operation. Computing the slice
+// at handler-init time saves 3 allocations per request: the outer/inner
+// slice literals and the map lookup are gone from the hot path.
+func (generator *Generator) securityReqsFieldName(opName string) string {
+	return generator.normalizer.decapitalize(opName) + "SecurityReqs"
+}
 
-	code := jen.Type().Id(routerName).Struct(
+func (generator *Generator) router(routerName string, serviceName string, hasSecuritySchemas bool, operations []operationWithPath) jen.Code {
+	fields := []jen.Code{
 		jen.Id("router").Qual("github.com/go-chi/chi/v5", "Router"),
 		jen.Id("service").Id(serviceName),
 		jen.Id("hooks").Op("*").Id("Hooks"),
-		securityHandlers,
-	)
+	}
+	if hasSecuritySchemas {
+		fields = append(fields, jen.Id("securityHandlers").Map(jen.Id("SecurityScheme")).Id("securityProcessor"))
+	}
 
-	return code
+	// Per-op precomputed [][]securityProcessor — populated once in the
+	// <Tag>Handler constructor instead of being built per request.
+	for _, op := range operations {
+		if op.operation.Security == nil || len(*op.operation.Security) == 0 {
+			continue
+		}
+		opName := generator.normalizer.normalizeOperationName(op.path, op.method)
+		fields = append(fields, jen.Id(generator.securityReqsFieldName(opName)).Index().Index().Id("securityProcessor"))
+	}
+
+	return jen.Type().Id(routerName).Struct(fields...)
 }
 
-func (generator *Generator) wrapperRequestParsers(wrapperName string, operation *openapi3.Operation) (result []jen.Code) {
-	linq.From(operation.Parameters).
-		GroupByT(
-			func(parameter *openapi3.ParameterRef) string { return parameter.Value.In },
-			func(parameter *openapi3.ParameterRef) *openapi3.ParameterRef { return parameter },
-		).
-		OrderByT(func(group linq.Group) string { return cast.ToString(group.Key) }).
-		SelectManyT(func(group linq.Group) linq.Query {
-			return linq.From(group.Group).SelectT(func(parameter *openapi3.ParameterRef) jen.Code {
-				in := parameter.Value.In
-				name := generator.normalizer.normalize(parameter.Value.Name)
-				paramName := in + name
+func (generator *Generator) wrapperRequestParsers(wrapperName string, operation *openapi3.Operation) []jen.Code {
+	// Group parameters by location ("header", "path", "query"), keep original
+	// order within each group, then process groups in lexical order of the
+	// location. Matches linq's GroupBy+OrderBy semantics.
+	type group struct {
+		in    string
+		items []*openapi3.ParameterRef
+	}
+	byIn := map[string][]*openapi3.ParameterRef{}
+	var inOrder []string
+	for _, p := range operation.Parameters {
+		if _, ok := byIn[p.Value.In]; !ok {
+			inOrder = append(inOrder, p.Value.In)
+		}
+		byIn[p.Value.In] = append(byIn[p.Value.In], p)
+	}
+	_ = inOrder // first-seen order, unused once we sort
+	groups := make([]group, 0, len(byIn))
+	for in, items := range byIn {
+		groups = append(groups, group{in: in, items: items})
+	}
+	slices.SortFunc(groups, func(a, b group) int { return strings.Compare(a.in, b.in) })
 
-				// Check for allOf
-				if parameter.Value.Schema.Value.AllOf != nil {
-					for _, schema := range parameter.Value.Schema.Value.AllOf {
-						if schema.Ref != "" {
-							// Create a new schema with the ref
-							parameter.Value.Schema = &openapi3.SchemaRef{
-								Ref:   schema.Ref,
-								Value: schema.Value,
-							}
-							break
+	var result []jen.Code
+	for _, g := range groups {
+		for _, parameter := range g.items {
+			in := parameter.Value.In
+			name := generator.normalizer.normalize(parameter.Value.Name)
+			paramName := in + name
+
+			// allOf flatten: a parameter described via allOf with a $ref gets
+			// rewritten so downstream emitters see the referenced schema.
+			if parameter.Value.Schema.Value.AllOf != nil {
+				for _, schema := range parameter.Value.Schema.Value.AllOf {
+					if schema.Ref != "" {
+						parameter.Value.Schema = &openapi3.SchemaRef{
+							Ref:   schema.Ref,
+							Value: schema.Value,
 						}
+						break
 					}
 				}
+			}
 
-				if generator.typee.isCustomType(parameter.Value.Schema.Value) {
-					return generator.wrapperCustomType(in, name, paramName, wrapperName, parameter)
-				}
+			switch {
+			case generator.typee.isCustomType(parameter.Value.Schema.Value):
+				result = append(result, generator.wrapperCustomType(in, name, paramName, wrapperName, parameter))
+			case len(parameter.Value.Schema.Value.Enum) > 0:
+				enumType := generator.normalizer.extractNameFromRef(parameter.Value.Schema.Ref)
+				result = append(result, generator.wrapperEnum(in, enumType, name, paramName, wrapperName, parameter))
+			case isSchemaType(parameter.Value.Schema.Value.Type, "integer"):
+				result = append(result, generator.wrapperInteger(in, name, paramName, wrapperName, parameter))
+			default:
+				result = append(result, generator.wrapperStr(in, name, paramName, wrapperName, parameter))
+			}
+		}
 
-				if len(parameter.Value.Schema.Value.Enum) > 0 {
-					enumType := generator.normalizer.extractNameFromRef(parameter.Value.Schema.Ref)
-					return generator.wrapperEnum(in, enumType, name, paramName, wrapperName, parameter)
-				}
-
-				if isSchemaType(parameter.Value.Schema.Value.Type, "integer") {
-					return generator.wrapperInteger(in, name, paramName, wrapperName, parameter)
-				}
-
-				return generator.wrapperStr(in, name, paramName, wrapperName, parameter)
-			}).Concat(linq.From([]jen.Code{
-				jen.Line().Add(jen.If(jen.Id("err").Op(":=").Id("request").Dot(strings.Title(cast.ToString(group.Key))).Dot("Validate").Call(),
-					jen.Id("err").Op("!=").Id("nil")).
-					Block(jen.Id("request").Dot("ProcessingResult").Op("=").Id("RequestProcessingResult").Values(jen.Id("error").Op(":").Id("err"),
-						jen.Id("typee").Op(":").Id(strings.Title(cast.ToString(group.Key))+"ValidationFailed")),
-						generator.hookCall("Request"+strings.Title(cast.ToString(group.Key))+"ValidationFailed",
-							jen.Id("r"),
-							jen.Lit(wrapperName),
-							jen.Id("request").Dot("ProcessingResult")),
-						jen.Line().Return())),
-				jen.Line().Add(jen.Line()).
-					Add(generator.hookCall("Request"+strings.Title(cast.ToString(group.Key))+"ParseCompleted",
+		// After all params of this `in` have been extracted: validate the
+		// sub-struct, then signal completion via the hook.
+		inTitle := strings.Title(g.in)
+		result = append(result,
+			jen.Line().Add(jen.If(jen.Id("err").Op(":=").Id("request").Dot(inTitle).Dot("Validate").Call(),
+				jen.Id("err").Op("!=").Id("nil")).
+				Block(jen.Id("request").Dot("ProcessingResult").Op("=").Id("RequestProcessingResult").Values(jen.Id("error").Op(":").Id("err"),
+					jen.Id("typee").Op(":").Id(inTitle+"ValidationFailed")),
+					generator.hookCall("Request"+inTitle+"ValidationFailed",
 						jen.Id("r"),
-						jen.Lit(wrapperName))),
-			}))
-		}).ToSlice(&result)
+						jen.Lit(wrapperName),
+						jen.Id("request").Dot("ProcessingResult")),
+					jen.Line().Return())),
+			jen.Line().Add(jen.Line()).
+				Add(generator.hookCall("Request"+inTitle+"ParseCompleted",
+					jen.Id("r"),
+					jen.Lit(wrapperName))),
+		)
+	}
 
 	return generator.normalizer.lineAfterEachElement(result...)
 }
@@ -1811,7 +1972,7 @@ func (generator *Generator) wrapperCustomType(in string, name string, paramName 
 	case "header":
 		result = result.Add(jen.Id(paramName + "Str").Op(":=").Id("r").Dot("Header").Dot("Get").Call(jen.Lit(parameter.Value.Name)))
 	case "query":
-		result = result.Add(jen.Id(paramName + "Str").Op(":=").Id("r").Dot("URL").Dot("Query").Call().Dot("Get").Call(jen.Lit(parameter.Value.Name)))
+		result = result.Add(jen.Id(paramName + "Str").Op(":=").Id("query").Dot("Get").Call(jen.Lit(parameter.Value.Name)))
 	case "path":
 		result = result.Add(jen.Id(paramName+"Str").Op(":=").Id("chi").Dot("URLParam").Call(jen.Id("r"), jen.Lit(parameter.Value.Name)))
 	default:
@@ -1891,7 +2052,7 @@ func (generator *Generator) wrapperEnum(in string, enumType string, name string,
 	case "header":
 		result = result.Add(jen.Id(paramName).Op(":=").Qual(generator.config.ComponentsPackage, enumType).Call(jen.Id("r").Dot("Header").Dot("Get").Call(jen.Lit(parameter.Value.Name))))
 	case "query":
-		result = result.Add(jen.Id(paramName).Op(":=").Qual(generator.config.ComponentsPackage, enumType).Call(jen.Id("r").Dot("URL").Dot("Query").Call().Dot("Get").Call(jen.Lit(parameter.Value.Name))))
+		result = result.Add(jen.Id(paramName).Op(":=").Qual(generator.config.ComponentsPackage, enumType).Call(jen.Id("query").Dot("Get").Call(jen.Lit(parameter.Value.Name))))
 	case "path":
 		result = result.Add(jen.Id(paramName).Op(":=").Qual(generator.config.ComponentsPackage, enumType).Call(jen.Id("chi").Dot("URLParam").Call(jen.Id("r"), jen.Lit(parameter.Value.Name))))
 	default:
@@ -1924,7 +2085,7 @@ func (generator *Generator) wrapperStr(in string, name string, paramName string,
 	case "header":
 		result = result.Add(jen.Id(paramName).Op(":=").Id("r").Dot("Header").Dot("Get").Call(jen.Lit(parameter.Value.Name)))
 	case "query":
-		result = result.Add(jen.Id(paramName).Op(":=").Id("r").Dot("URL").Dot("Query").Call().Dot("Get").Call(jen.Lit(parameter.Value.Name)))
+		result = result.Add(jen.Id(paramName).Op(":=").Id("query").Dot("Get").Call(jen.Lit(parameter.Value.Name)))
 	case "path":
 		result = result.Add(jen.Id(paramName).Op(":=").Id("chi").Dot("URLParam").Call(jen.Id("r"), jen.Lit(parameter.Value.Name)))
 	default:
@@ -1932,10 +2093,11 @@ func (generator *Generator) wrapperStr(in string, name string, paramName string,
 	}
 
 	if parameter.Value.Required {
+		emptyErr := generator.errVar(fmt.Sprintf("%s is empty", parameter.Value.Name), errFileRoutes)
 		result = result.
 			Add(jen.Line()).
 			Add(jen.If(jen.Id(paramName).Op("==").Lit("")).Block(
-				jen.Id("err").Op(":=").Qual("fmt", "Errorf").Call(jen.Lit(fmt.Sprintf("%s is empty", parameter.Value.Name))).Line(),
+				jen.Id("err").Op(":=").Id(emptyErr).Line(),
 				jen.Id("request").Dot("ProcessingResult").Op("=").Id("RequestProcessingResult").Values(jen.Id("error").Op(":").Id("err"),
 					jen.Id("typee").Op(":").Id(strings.Title(in)+"ParseFailed")),
 				generator.hookCall("Request"+strings.Title(in)+"ParseFailed",
@@ -1949,11 +2111,11 @@ func (generator *Generator) wrapperStr(in string, name string, paramName string,
 
 	regex := generator.getXGoRegex(parameter.Value.Schema)
 	if regex != "" {
-		regexVarName := generator.useRegex[regex] // generator.normalizer.decapitalize(wrapperName) + strings.Title(in) + name + "Regex"
+		regexVarName := generator.useRegex[regex]
+		regexErr := generator.errVar(fmt.Sprintf("%s not matched by the '%s' regex", parameter.Value.Name, regex), errFileRoutes)
 
 		result = result.Line().If(jen.Op("!").Id(regexVarName).Dot("MatchString").Call(jen.Id(paramName))).Block(
-			jen.Id("err").Op(":=").Qual("fmt",
-				"Errorf").Call(jen.Lit(fmt.Sprintf("%s not matched by the '%s' regex", parameter.Value.Name, regex))),
+			jen.Id("err").Op(":=").Id(regexErr),
 			jen.Line(),
 			jen.Id("request").Dot("ProcessingResult").Op("=").Id("RequestProcessingResult").Values(jen.Id("error").Op(":").Id("err"),
 				jen.Id("typee").Op(":").Id(fmt.Sprintf("%sParseFailed", strings.Title(in)))),
@@ -1982,7 +2144,7 @@ func (generator *Generator) wrapperInteger(in string, name string, paramName str
 	case "header":
 		result = result.Add(jen.Id(paramName).Op(":=").Id("r").Dot("Header").Dot("Get").Call(jen.Lit(parameter.Value.Name)))
 	case "query":
-		result = result.Add(jen.Id(paramName).Op(":=").Id("r").Dot("URL").Dot("Query").Call().Dot("Get").Call(jen.Lit(parameter.Value.Name)))
+		result = result.Add(jen.Id(paramName).Op(":=").Id("query").Dot("Get").Call(jen.Lit(parameter.Value.Name)))
 	case "path":
 		result = result.Add(jen.Id(paramName).Op(":=").Id("chi").Dot("URLParam").Call(jen.Id("r"), jen.Lit(parameter.Value.Name)))
 	default:
@@ -1990,10 +2152,11 @@ func (generator *Generator) wrapperInteger(in string, name string, paramName str
 	}
 
 	if parameter.Value.Required {
+		emptyErr := generator.errVar(fmt.Sprintf("%s is empty", parameter.Value.Name), errFileRoutes)
 		result = result.
 			Add(jen.Line()).
 			Add(jen.If(jen.Id(paramName).Op("==").Lit("")).Block(
-				jen.Id("err").Op(":=").Qual("fmt", "Errorf").Call(jen.Lit(fmt.Sprintf("%s is empty", parameter.Value.Name))).Line(),
+				jen.Id("err").Op(":=").Id(emptyErr).Line(),
 				jen.Id("request").Dot("ProcessingResult").Op("=").Id("RequestProcessingResult").Values(jen.Id("error").Op(":").Id("err"),
 					jen.Id("typee").Op(":").Id(strings.Title(in)+"ParseFailed")),
 				generator.hookCall("Request"+strings.Title(in)+"ParseFailed",
@@ -2021,7 +2184,7 @@ func (generator *Generator) wrapperBody(method string, path string, contentType 
 	name := generator.normalizer.extractNameFromRef(body.Ref)
 
 	if name == "" {
-		name = generator.normalizer.normalizeOperationName(path, method) + generator.normalizer.contentType(cast.ToString(contentType)) + "RequestBody"
+		name = generator.normalizer.normalizeOperationName(path, method) + generator.normalizer.contentType(contentType) + "RequestBody"
 	}
 
 	result = result.
@@ -2096,23 +2259,15 @@ func (generator *Generator) wrapperSecurity(name string, operation *openapi3.Ope
 
 	skipSecurityCheck := generator.typee.getXGoSkipSecurityCheck(operation)
 
-	var schemasCode []jen.Code
-	linq.From(*operation.Security).
-		SelectT(func(securityRequirement openapi3.SecurityRequirement) jen.Code {
-			var handlers []jen.Code
-			linq.From(securityRequirement).SelectT(func(kv linq.KeyValue) jen.Code {
-				return jen.Id("router").Dot("securityHandlers").Index(jen.Id("SecurityScheme" + strings.Title(cast.ToString(kv.Key))))
-			}).ToSlice(&handlers)
-
-			return jen.Values(handlers...)
-		}).
-		ToSlice(&schemasCode)
-
-	requirementsLiteral := jen.Index().Index().Id("securityProcessor").Values(schemasCode...)
+	// The [][]securityProcessor is precomputed in the <Tag>Handler
+	// constructor (router.<opNameSecurityReqs>), saving 3 allocations per
+	// request: outer slice, inner slice(s), and map lookup.
 	skipCheckLit := jen.Lit(skipSecurityCheck)
 
 	// Single call into the package-level extractSecurity helper, replacing
 	// ~80 lines of inlined loop boilerplate per operation with security.
+	securityFailedErr := generator.errVar("failed passing security checks", errFileRoutes)
+
 	return jen.Null().
 		Add(jen.Line()).
 		Add(jen.List(jen.Id("results"), jen.Id("passed")).Op(":=").
@@ -2120,14 +2275,14 @@ func (generator *Generator) wrapperSecurity(name string, operation *openapi3.Ope
 			jen.Id("r"),
 			jen.Id("router").Dot("hooks"),
 			jen.Lit(name),
-			requirementsLiteral,
+			jen.Id("router").Dot(generator.securityReqsFieldName(name)),
 			skipCheckLit,
 		)).
 		Add(jen.Line()).
 		Add(jen.Id("request").Dot("SecurityCheckResults").Op("=").Id("results")).
 		Add(jen.Line()).
 		Add(jen.If(jen.Op("!").Id("passed")).Block(
-			jen.Id("err").Op(":=").Qual("fmt", "Errorf").Call(jen.Lit("failed passing security checks")),
+			jen.Id("err").Op(":=").Id(securityFailedErr),
 			jen.Id("request").Dot("ProcessingResult").Op("=").Id("RequestProcessingResult").Values(
 				jen.Id("error").Op(":").Id("err"),
 				jen.Id("typee").Op(":").Id("SecurityParseFailed"),
@@ -2144,8 +2299,24 @@ func (generator *Generator) wrapperSecurity(name string, operation *openapi3.Ope
 		Add(jen.Line())
 }
 func (generator *Generator) wrapperRequestParser(name string, requestName string, routerName, method string, path string, operation *openapi3.Operation, requestBody *openapi3.SchemaRef, contentType string) jen.Code {
-	funcCode := []jen.Code{
-		jen.Id("request").Dot("ProcessingResult").Op("=").Id("RequestProcessingResult").Values(jen.Id("typee").Op(":").Id("ParseSucceed")).Line(),
+	// ParseSucceed is the zero value of requestProcessingResultType, so the
+	// named-return request already has ProcessingResult.typee == ParseSucceed.
+	// No explicit assignment needed.
+	var funcCode []jen.Code
+
+	// Cache r.URL.Query() once at the top when there are any query parameters
+	// — url.ParseQuery is non-trivial (map alloc + per-key string parsing) and
+	// the per-param `wrapperStr/Integer/Enum/CustomType` emitters use the
+	// pre-parsed `query` local instead of re-calling r.URL.Query() each time.
+	hasQueryParam := false
+	for _, p := range operation.Parameters {
+		if p.Value.In == "query" {
+			hasQueryParam = true
+			break
+		}
+	}
+	if hasQueryParam {
+		funcCode = append(funcCode, jen.Id("query").Op(":=").Id("r").Dot("URL").Dot("Query").Call())
 	}
 
 	funcCode = append(funcCode, generator.wrapperSecurity(name, operation))
@@ -2236,23 +2407,25 @@ func (generator *Generator) requestResponseBuilders(swagger *openapi3.T) jen.Cod
 }
 
 // respondFunc emits the one-time `respond` helper invoked by every wrapper.
+// Takes *response directly (no interface dispatch) — the wrapper emits the
+// right unwrap based on whether the operation uses generic mode or classic.
 func (generator *Generator) respondFunc() jen.Code {
 	const src = `
-func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, response responseInterface, hasContent bool) {
-	for header, value := range response.headers() {
+func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, resp *response, hasContent bool) {
+	for header, value := range resp.headers {
 		w.Header().Set(header, value)
 	}
 
-	for _, c := range response.cookies() {
-		cookie := c
-		http.SetCookie(w, &cookie)
+	cookies := resp.cookies
+	for i := range cookies {
+		http.SetCookie(w, &cookies[i])
 	}
 
-	if url := response.redirectURL(); url != "" {
-		switch response.statusCode() {
+	if url := resp.redirectURL; url != "" {
+		switch resp.statusCode {
 		case 301, 302, 303, 307, 308:
 			hooks.RequestRedirectStarted(r, name, url)
-			http.Redirect(w, r, url, response.statusCode())
+			http.Redirect(w, r, url, resp.statusCode)
 			hooks.ServiceCompleted(r, name)
 			return
 		}
@@ -2261,42 +2434,42 @@ func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, 
 	hooks.RequestProcessingCompleted(r, name)
 
 	if !hasContent {
-		w.WriteHeader(response.statusCode())
+		w.WriteHeader(resp.statusCode)
 		hooks.ServiceCompleted(r, name)
 		return
 	}
 
-	if ct := response.contentType(); ct != "" {
-		w.Header().Set("content-type", ct)
+	if ct := resp.contentType; ct != "" {
+		w.Header().Set("Content-Type", ct)
 	}
 
-	w.WriteHeader(response.statusCode())
+	w.WriteHeader(resp.statusCode)
 
 	var body []byte
-	if response.body() != nil {
+	if resp.body != nil {
 		var err error
-		switch response.contentType() {
+		switch resp.contentType {
 		case "application/xml":
-			body, err = xml.Marshal(response.body())
+			body, err = xml.Marshal(resp.body)
 		case "application/octet-stream":
 			var ok bool
-			if body, ok = (response.body()).([]byte); !ok {
+			if body, ok = (resp.body).([]byte); !ok {
 				err = errors.New("body is not []byte")
 			}
 		case "text/html":
-			body = []byte(fmt.Sprint(response.body()))
+			body = []byte(fmt.Sprint(resp.body))
 		case "application/json":
 			fallthrough
 		default:
-			body, err = json.Marshal(response.body())
+			body, err = json.Marshal(resp.body)
 		}
 		if err != nil {
 			hooks.ResponseBodyMarshalFailed(w, r, name, err)
 			return
 		}
 		hooks.ResponseBodyMarshalCompleted(r, name)
-	} else if len(response.bodyRaw()) > 0 {
-		body = response.bodyRaw()
+	} else if len(resp.bodyRaw) > 0 {
+		body = resp.bodyRaw
 	}
 
 	if len(body) > 0 {
@@ -2542,79 +2715,56 @@ func (generator *Generator) serviceReturnType(op *openapi3.Operation, name strin
 }
 
 func (generator *Generator) handlersInterfaces(swagger *openapi3.T) jen.Code {
-	var result []jen.Code
+	// One <Tag>Service interface per tag, listing every operation under that
+	// tag. Ops without tags fall under "Default". Within a tag, methods appear
+	// in path/operation order; tags themselves are emitted in lexical order
+	// for determinism.
+	methodsByTag := map[string][]jen.Code{}
+	for _, pathEntry := range sortedMapEntries(swagger.Paths.Map()) {
+		path := pathEntry.Key
+		for _, opEntry := range sortedMapEntries(pathEntry.Value.Operations()) {
+			operation := opEntry.Value
+			tag := generator.normalizer.normalize("Default")
+			if len(operation.Tags) > 0 {
+				tag = generator.normalizer.normalize(operation.Tags[0])
+			}
 
-	linq.From(sortedMapEntries(swagger.Paths.Map())).
-		SelectManyT(
-			func(entry sortedKeyValue[string, *openapi3.PathItem]) linq.Query {
-				path := entry.Key
-				taggedInterfaceMethods := map[string][]jen.Code{}
+			name := generator.normalizer.normalizeOperationName(path, opEntry.Key)
+			returnType := generator.serviceReturnType(operation, name)
 
-				linq.From(sortedMapEntries(entry.Value.Operations())).
-					GroupByT(func(entry sortedKeyValue[string, *openapi3.Operation]) string {
-						// Handle operations without tags by providing a default tag
-						if len(entry.Value.Tags) == 0 {
-							return generator.normalizer.normalize("Default")
-						}
-						return generator.normalizer.normalize(entry.Value.Tags[0])
-					},
-						func(entry sortedKeyValue[string, *openapi3.Operation]) []jen.Code {
-							name := generator.normalizer.normalizeOperationName(path, entry.Key)
-							operation := entry.Value
-							returnType := generator.serviceReturnType(operation, name)
+			if operation.RequestBody == nil || len(operation.RequestBody.Value.Content) == 1 {
+				methodsByTag[tag] = append(methodsByTag[tag],
+					jen.Id(name).Params(generator.interfaceMethodParams(name+"Request")...).Params(returnType))
+				continue
+			}
 
-							if operation.RequestBody == nil {
-								return []jen.Code{jen.Id(name).Params(generator.interfaceMethodParams(name + "Request")...).Params(returnType)}
-							}
+			// Multiple content-types: one interface method per content-type.
+			for _, ctEntry := range sortedMapEntries(operation.RequestBody.Value.Content) {
+				contentTypedName := name + generator.normalizer.contentType(ctEntry.Key)
+				methodsByTag[tag] = append(methodsByTag[tag],
+					jen.Id(contentTypedName).Params(generator.interfaceMethodParams(contentTypedName+"Request")...).Params(returnType))
+			}
+		}
+	}
 
-							//if we have only one content type we dont need to have it inside function name
-							if len(operation.RequestBody.Value.Content) == 1 {
-								return []jen.Code{jen.Id(name).Params(generator.interfaceMethodParams(name + "Request")...).Params(returnType)}
-							}
+	tags := make([]string, 0, len(methodsByTag))
+	for t := range methodsByTag {
+		tags = append(tags, t)
+	}
+	slices.Sort(tags)
 
-							var contentTypedInterfaceMethods []jen.Code
-							// Sort content types to ensure deterministic interface method generation order
-							var contentTypes []string
-							for contentType := range operation.RequestBody.Value.Content {
-								contentTypes = append(contentTypes, contentType)
-							}
-							slices.Sort(contentTypes)
-
-							for _, contentType := range contentTypes {
-								contentTypedName := name + generator.normalizer.contentType(contentType)
-								contentTypedInterfaceMethods = append(contentTypedInterfaceMethods,
-									jen.Id(contentTypedName).Params(generator.interfaceMethodParams(contentTypedName+"Request")...).Params(returnType))
-							}
-
-							return contentTypedInterfaceMethods
-						}).
-					OrderByT(func(kv linq.Group) interface{} { return kv.Key }).
-					ToMapByT(&taggedInterfaceMethods,
-						func(kv linq.Group) interface{} { return kv.Key },
-						func(kv linq.Group) (grouped []jen.Code) {
-							linq.From(kv.Group).SelectMany(func(i interface{}) linq.Query { return linq.From(i) }).ToSlice(&grouped)
-							return
-						},
-					)
-
-				return linq.From(toLinqKeyValue(sortedMapEntries(taggedInterfaceMethods)))
-			}).
-		GroupByT(
-			func(kv linq.KeyValue) interface{} { return kv.Key },
-			func(kv linq.KeyValue) interface{} { return kv.Value },
-		).
-		OrderByT(func(group linq.Group) interface{} { return cast.ToString(group.Key) }).
-		SelectT(func(kv linq.Group) jen.Code {
-			var grouped []jen.Code
-			linq.From(kv.Group).SelectMany(func(i interface{}) linq.Query { return linq.From(i) }).ToSlice(&grouped)
-			return jen.Type().Id(strings.Title(cast.ToString(kv.Key)) + "Service").Interface(grouped...)
-		}).
-		ToSlice(&result)
-
+	result := make([]jen.Code, 0, len(tags))
+	for _, tag := range tags {
+		result = append(result, jen.Type().Id(strings.Title(tag)+"Service").Interface(methodsByTag[tag]...))
+	}
 	return jen.Null().Add(generator.normalizer.doubleLineAfterEachElement(result...)...)
 }
 
 func (generator *Generator) responseStruct() jen.Code {
+	// responseInterface is single-method (inner) used only by classic-mode
+	// per-op response types so the wrapper can extract *response from the
+	// concrete value behind the per-op interface. Generic mode accesses
+	// &Response[B].response directly without going through this interface.
 	return jen.Type().Id("response").Struct(
 		jen.Id("statusCode").Id("int"),
 		jen.Id("body").Interface(),
@@ -2625,13 +2775,7 @@ func (generator *Generator) responseStruct() jen.Code {
 		jen.Id("cookies").Index().Qual("net/http", "Cookie"),
 	).Add(jen.Line().Line()).
 		Add(jen.Type().Id("responseInterface").Interface(
-			jen.Id("statusCode").Params().Id("int"),
-			jen.Id("body").Params().Interface(),
-			jen.Id("bodyRaw").Params().Index().Byte(),
-			jen.Id("contentType").Params().Id("string"),
-			jen.Id("redirectURL").Params().Id("string"),
-			jen.Id("cookies").Params().Index().Qual("net/http", "Cookie"),
-			jen.Id("headers").Params().Map(jen.Id("string")).Id("string")))
+			jen.Id("inner").Params().Op("*").Id("response")))
 }
 
 func (generator *Generator) responseInterface(name string) jen.Code {
@@ -2672,13 +2816,11 @@ type Response[B any] struct {
 	response
 }
 
-func (r *Response[B]) statusCode() int            { return r.response.statusCode }
-func (r *Response[B]) body() interface{}          { return r.response.body }
-func (r *Response[B]) bodyRaw() []byte            { return r.response.bodyRaw }
-func (r *Response[B]) contentType() string        { return r.response.contentType }
-func (r *Response[B]) redirectURL() string        { return r.response.redirectURL }
-func (r *Response[B]) headers() map[string]string { return r.response.headers }
-func (r *Response[B]) cookies() []http.Cookie     { return r.response.cookies }
+// inner satisfies responseInterface so generic-mode responses can be passed
+// to respond via a single-method indirection if ever needed. In practice the
+// per-operation wrapper accesses &result.response directly, bypassing the
+// interface for zero dispatch overhead.
+func (r *Response[B]) inner() *response { return &r.response }
 
 type ResponseBuilder[B any] struct {
 	response
@@ -2787,46 +2929,15 @@ func (generator *Generator) responseType(name string) jen.Code {
 	)
 
 	declaration := jen.Type().Id(decapicalizedName + "Response").Struct(jen.Id("response"))
-	interfaceImplementation := jen.Func().Params(jen.Id(decapicalizedName+"Response")).Id(decapicalizedName+"Response").Params().Block().
+	// Marker method + inner() to surface *response for the shared respond
+	// helper. Was 7 accessor methods; collapsed to one to eliminate per-call
+	// interface dispatch in respond. Both methods are pointer-receiver so
+	// the corresponding Build() returns *<type> (no struct copy/escape).
+	interfaceImplementation := jen.Func().Params(jen.Op("*").Id(decapicalizedName+"Response")).Id(decapicalizedName+"Response").Params().Block().
 		Add(jen.Line(), jen.Line()).
 		Add(jen.Func().Params(
-			jen.Id("response").Id(decapicalizedName+"Response")).Id("statusCode").Params().Params(
-			jen.Id("int")).Block(
-			jen.Return().Id("response").Dot("response").Dot("statusCode"),
-		)).
-		Add(jen.Line(), jen.Line()).
-		Add(jen.Func().Params(
-			jen.Id("response").Id(decapicalizedName+"Response")).Id("body").Params().Params(jen.Interface()).Block(
-			jen.Return().Id("response").Dot("response").Dot("body"),
-		)).
-		Add(jen.Line(), jen.Line()).
-		Add(jen.Func().Params(
-			jen.Id("response").Id(decapicalizedName+"Response")).Id("bodyRaw").Params().Params(jen.Index().Byte()).Block(
-			jen.Return().Id("response").Dot("response").Dot("bodyRaw"),
-		)).
-		Add(jen.Line(), jen.Line()).
-		Add(jen.Func().Params(
-			jen.Id("response").Id(decapicalizedName+"Response")).Id("contentType").Params().Params(
-			jen.Id("string")).Block(
-			jen.Return().Id("response").Dot("response").Dot("contentType"),
-		)).
-		Add(jen.Line(), jen.Line()).
-		Add(jen.Func().Params(
-			jen.Id("response").Id(decapicalizedName+"Response")).Id("redirectURL").Params().Params(
-			jen.Id("string")).Block(
-			jen.Return().Id("response").Dot("response").Dot("redirectURL"),
-		)).
-		Add(jen.Line(), jen.Line()).
-		Add(jen.Func().Params(
-			jen.Id("response").Id(decapicalizedName+"Response")).Id("headers").Params().Params(
-			jen.Map(jen.Id("string")).Id("string")).Block(
-			jen.Return().Id("response").Dot("response").Dot("headers"),
-		)).
-		Add(jen.Line(), jen.Line()).
-		Add(jen.Func().Params(
-			jen.Id("response").Id(decapicalizedName + "Response")).Id("cookies").Params().Params(
-			jen.Index().Qual("net/http", "Cookie")).Block(
-			jen.Return().Id("response").Dot("response").Dot("cookies"),
+			jen.Id("r").Op("*").Id(decapicalizedName+"Response")).Id("inner").Params().Op("*").Id("response").Block(
+			jen.Return().Op("&").Id("r").Dot("response"),
 		))
 
 	return jen.Null().Add(generator.normalizer.doubleLineAfterEachElement(interfaceDeclaration, declaration, interfaceImplementation)...)
@@ -2986,7 +3097,7 @@ func (generator *Generator) responseStatusCodeBuilder(resp operationResponse, bu
 		results = append(results, jen.Func().Params(
 			jen.Id("builder").Op("*").Id(builderName)).Id("StatusCode"+resp.StatusCode).Params(jen.Id("redirectURL").String()).Params(
 			jen.Op("*").Id(nextBuilderName)).Block(
-			jen.Id("builder").Dot("response").Dot("statusCode").Op("=").Lit(cast.ToInt(resp.StatusCode)),
+			jen.Id("builder").Dot("response").Dot("statusCode").Op("=").Lit(mustParseStatusCode(resp.StatusCode)),
 			jen.Id("builder").Dot("response").Dot("redirectURL").Op("=").Id("redirectURL"),
 			jen.Line().Return().Op("&").Id(nextBuilderName).Values(jen.Id("response").Op(":").Id("builder").Dot("response")),
 		))
@@ -2994,7 +3105,7 @@ func (generator *Generator) responseStatusCodeBuilder(resp operationResponse, bu
 		results = append(results, jen.Func().Params(
 			jen.Id("builder").Op("*").Id(builderName)).Id("StatusCode"+resp.StatusCode).Params().Params(
 			jen.Op("*").Id(nextBuilderName)).Block(
-			jen.Id("builder").Dot("response").Dot("statusCode").Op("=").Lit(cast.ToInt(resp.StatusCode)),
+			jen.Id("builder").Dot("response").Dot("statusCode").Op("=").Lit(mustParseStatusCode(resp.StatusCode)),
 			jen.Line().Return().Op("&").Id(nextBuilderName).Values(jen.Id("response").Op(":").Id("builder").Dot("response")),
 		))
 	}
@@ -3039,11 +3150,12 @@ func (generator *Generator) responseAssembler(assemblerName string, interfaceRes
 	//assembler struct
 	results = append(results, jen.Type().Id(assemblerName).Struct(jen.Id("response")))
 
-	//assembler.Build()
+	// assembler.Build() — returns *responseName so the marker/inner()
+	// methods (pointer receivers) are present in the value's method set.
 	results = append(results, jen.Func().Params(
 		jen.Id("builder").Op("*").Id(assemblerName)).Id("Build").Params().Params(
 		jen.Id(interfaceResponseName)).Block(
-		jen.Return().Id(responseName).Values(jen.Id("response").Op(":").Id("builder").Dot("response"))),
+		jen.Return().Op("&").Id(responseName).Values(jen.Id("response").Op(":").Id("builder").Dot("response"))),
 	)
 	return
 }
@@ -3051,13 +3163,13 @@ func (generator *Generator) responseAssembler(assemblerName string, interfaceRes
 func (generator *Generator) securitySchemas(swagger *openapi3.T) jen.Code {
 	code := jen.Type().Id("SecurityScheme").Id("string").Line().Line()
 
-	var consts []jen.Code
-	linq.From(sortedMapEntries(swagger.Components.SecuritySchemes)).
-		SelectT(func(entry sortedKeyValue[string, *openapi3.SecuritySchemeRef]) jen.Code {
-			name := strings.Title(entry.Key)
-			return jen.Id("SecurityScheme" + name).Id("SecurityScheme").Op("=").Lit(name)
-		}).
-		ToSlice(&consts)
+	entries := sortedMapEntries(swagger.Components.SecuritySchemes)
+
+	consts := make([]jen.Code, 0, len(entries))
+	for _, entry := range entries {
+		name := strings.Title(entry.Key)
+		consts = append(consts, jen.Id("SecurityScheme"+name).Id("SecurityScheme").Op("=").Lit(name))
+	}
 
 	code = code.Const().Defs(consts...).Line().Line()
 
@@ -3071,45 +3183,48 @@ func (generator *Generator) securitySchemas(swagger *openapi3.T) jen.Code {
 			jen.Id("value").Id("string")).Params(
 			jen.Id("error")))
 
-	var extractorsHeadersFuncs []jen.Code
-	linq.From(sortedMapEntries(swagger.Components.SecuritySchemes)).
-		SelectT(func(entry sortedKeyValue[string, *openapi3.SecuritySchemeRef]) jen.Code {
-			name := generator.normalizer.normalize(entry.Key)
-			schema := entry.Value
+	extractorsHeadersFuncs := make([]jen.Code, 0, len(entries)+1)
+	for _, entry := range entries {
+		name := generator.normalizer.normalize(entry.Key)
+		schema := entry.Value
 
-			if schema.Value.Type == "http" {
-				ifStatement := jen.Null()
-				assignment := jen.Null()
-				if schema.Value.Scheme == "bearer" {
-					ifStatement = ifStatement.Op("!").Qual("strings", "HasPrefix").Call(jen.Id("value"), jen.Lit("Bearer "))
-					assignment = assignment.Id("value").Op("=").Id("value").Index(jen.Lit(7), jen.Empty())
-				} else {
-					ifStatement = ifStatement.Op("!").Qual("strings", "HasPrefix").Call(jen.Id("value"), jen.Lit("Basic "))
-					assignment = assignment.Id("value").Op("=").Id("value").Index(jen.Lit(6), jen.Empty())
-				}
+		if schema.Value.Type == "http" {
+			ifStatement := jen.Null()
+			assignment := jen.Null()
+			if schema.Value.Scheme == "bearer" {
+				ifStatement = ifStatement.Op("!").Qual("strings", "HasPrefix").Call(jen.Id("value"), jen.Lit("Bearer "))
+				assignment = assignment.Id("value").Op("=").Id("value").Index(jen.Lit(7), jen.Empty())
+			} else {
+				ifStatement = ifStatement.Op("!").Qual("strings", "HasPrefix").Call(jen.Id("value"), jen.Lit("Basic "))
+				assignment = assignment.Id("value").Op("=").Id("value").Index(jen.Lit(6), jen.Empty())
+			}
 
-				return jen.Line().Id("SecurityScheme"+strings.Title(name)).Op(":").Func().Params(
+			extractorsHeadersFuncs = append(extractorsHeadersFuncs,
+				jen.Line().Id("SecurityScheme"+strings.Title(name)).Op(":").Func().Params(
 					jen.Id("r").Op("*").Qual("net/http", "Request")).Params(jen.Id("string"), jen.Id("string"),
 					jen.Id("bool")).Block(
 					jen.Id("value").Op(":=").Id("r").Dot("Header").Dot("Get").Call(jen.Lit("Authorization")).Line(),
 					jen.If(ifStatement).Block(jen.Return().List(jen.Lit(""), jen.Lit(""), jen.Id("false"))).Line(),
 					assignment.Line(),
-					jen.Return().List(jen.Lit(schema.Value.Name), jen.Id("value"), jen.Id("value").Op("!=").Lit("")))
-			}
+					jen.Return().List(jen.Lit(schema.Value.Name), jen.Id("value"), jen.Id("value").Op("!=").Lit(""))))
+			continue
+		}
 
-			if schema.Value.Type == "apiKey" {
-				switch schema.Value.In {
-				case "header":
-					return jen.Line().Id("SecurityScheme"+strings.Title(name)).Op(":").Func().Params(
+		if schema.Value.Type == "apiKey" {
+			switch schema.Value.In {
+			case "header":
+				extractorsHeadersFuncs = append(extractorsHeadersFuncs,
+					jen.Line().Id("SecurityScheme"+strings.Title(name)).Op(":").Func().Params(
 						jen.Id("r").Op("*").Qual("net/http",
 							"Request")).Params(
 						jen.Id("string"), jen.Id("string"),
 						jen.Id("bool")).Block(
 						jen.Id("value").Op(":=").Id("r").Dot("Header").Dot("Get").Call(jen.Lit(schema.Value.Name)).Line(),
 						jen.Return().List(jen.Lit(schema.Value.Name), jen.Id("value"),
-							jen.Id("value").Op("!=").Lit("")))
-				case "cookie":
-					return jen.Line().Id("SecurityScheme"+strings.Title(name)).Op(":").Func().Params(
+							jen.Id("value").Op("!=").Lit(""))))
+			case "cookie":
+				extractorsHeadersFuncs = append(extractorsHeadersFuncs,
+					jen.Line().Id("SecurityScheme"+strings.Title(name)).Op(":").Func().Params(
 						jen.Id("r").Op("*").Qual("net/http",
 							"Request")).Params(
 						jen.Id("string"), jen.Id("string"),
@@ -3117,12 +3232,13 @@ func (generator *Generator) securitySchemas(swagger *openapi3.T) jen.Code {
 						jen.List(jen.Id("cookie"), jen.Id("err")).
 							Op(":=").Id("r").Dot("Cookie").Call(jen.Lit(schema.Value.Name)).Line(),
 						jen.If(jen.Id("err").Op("!=").Id("nil")).Block(jen.Return().List(jen.Lit(""), jen.Lit(""), jen.Id("false"))).Line(),
-						jen.Return().List(jen.Id("cookie").Dot("Name"), jen.Id("cookie").Dot("Value"), jen.Id("true")))
-				}
+						jen.Return().List(jen.Id("cookie").Dot("Name"), jen.Id("cookie").Dot("Value"), jen.Id("true"))))
 			}
+			continue
+		}
 
-			return jen.Null()
-		}).ToSlice(&extractorsHeadersFuncs)
+		extractorsHeadersFuncs = append(extractorsHeadersFuncs, jen.Null())
+	}
 
 	extractorsHeadersFuncs = append(extractorsHeadersFuncs, jen.Line())
 
@@ -3130,18 +3246,18 @@ func (generator *Generator) securitySchemas(swagger *openapi3.T) jen.Code {
 		jen.Id("r").Op("*").Qual("net/http", "Request")).Params(jen.Id("string"), jen.Id("string"),
 		jen.Id("bool")).Values(extractorsHeadersFuncs...)
 
-	var interfaceFuncs []jen.Code
-	linq.From(sortedMapEntries(swagger.Components.SecuritySchemes)).
-		SelectT(func(entry sortedKeyValue[string, *openapi3.SecuritySchemeRef]) interface{} { return entry.Key }).
-		SelectT(func(name string) jen.Code {
-			return jen.Id("SecurityScheme"+strings.Title(name)).Params(
+	interfaceFuncs := make([]jen.Code, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Key
+		interfaceFuncs = append(interfaceFuncs,
+			jen.Id("SecurityScheme"+strings.Title(name)).Params(
 				jen.Id("r").Op("*").Qual("net/http",
 					"Request"),
 				jen.Id("scheme").Id("SecurityScheme"),
 				jen.Id("name").Id("string"),
 				jen.Id("value").Id("string")).Params(
-				jen.Id("error"))
-		}).ToSlice(&interfaceFuncs)
+				jen.Id("error")))
+	}
 
 	code = code.Line().Line().Type().Id("SecuritySchemas").Interface(interfaceFuncs...)
 
@@ -3158,27 +3274,25 @@ func (generator *Generator) headersStruct(name string, headers map[string]*opena
 		return jen.Null()
 	}
 
-	var headersCode []jen.Code
+	// Sort keys for deterministic field/value ordering — map iteration order
+	// is non-deterministic otherwise.
+	entries := sortedMapEntries(headers)
 
-	linq.From(headers).SelectT(func(kv linq.KeyValue) jen.Code {
-		name := generator.normalizer.normalize(cast.ToString(kv.Key))
-		field := jen.Id(name)
+	headersCode := make([]jen.Code, 0, len(entries))
+	headersMapCode := make([]jen.Code, 0, len(entries))
+	for _, entry := range entries {
+		key := entry.Key
+		fieldName := generator.normalizer.normalize(key)
 
-		generator.typee.fillGoType(field, "", name, kv.Value.(*openapi3.HeaderRef).Value.Schema, false, false)
+		field := jen.Id(fieldName)
+		generator.typee.fillGoType(field, "", fieldName, entry.Value.Value.Schema, false, false)
+		headersCode = append(headersCode, field)
 
-		return field
-	}).ToSlice(&headersCode)
+		headersMapCode = append(headersMapCode,
+			jen.Lit(key).Op(":").Qual("github.com/spf13/cast", "ToString").Call(jen.Id("headers").Dot(fieldName)))
+	}
 
 	headersStruct := jen.Type().Id(name).Struct(headersCode...)
-
-	var headersMapCode []jen.Code
-
-	linq.From(headers).SelectT(func(kv linq.KeyValue) jen.Code {
-		key := cast.ToString(kv.Key)
-		name := generator.normalizer.normalize(key)
-		return jen.Lit(key).Op(":").Qual("github.com/spf13/cast", "ToString").Call(jen.Id("headers").Dot(name))
-	}).ToSlice(&headersMapCode)
-
 	headersToMap := jen.Func().Params(
 		jen.Id("headers").Id(name)).Id("toMap").Params().Params(
 		jen.Map(jen.Id("string")).Id("string")).Block(

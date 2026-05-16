@@ -173,7 +173,8 @@ func extractSecurity(
 type requestProcessingResultType uint8
 
 const (
-	BodyUnmarshalFailed requestProcessingResultType = iota + 1
+	ParseSucceed requestProcessingResultType = iota
+	BodyUnmarshalFailed
 	BodyValidationFailed
 	HeaderParseFailed
 	HeaderValidationFailed
@@ -183,7 +184,6 @@ const (
 	PathValidationFailed
 	SecurityParseFailed
 	SecurityCheckFailed
-	ParseSucceed
 )
 
 type RequestProcessingResult struct {
@@ -219,16 +219,19 @@ func WidgetsHandler(impl WidgetsService, r chi.Router, hooks *Hooks, securitySch
 		},
 	}
 
+	router.getWidgetsSecureSecurityReqs = [][]securityProcessor{{router.securityHandlers[SecuritySchemeBearer]}}
+
 	router.mount()
 
 	return router.router
 }
 
 type widgetsRouter struct {
-	router           chi.Router
-	service          WidgetsService
-	hooks            *Hooks
-	securityHandlers map[SecurityScheme]securityProcessor
+	router                       chi.Router
+	service                      WidgetsService
+	hooks                        *Hooks
+	securityHandlers             map[SecurityScheme]securityProcessor
+	getWidgetsSecureSecurityReqs [][]securityProcessor
 }
 
 func (router *widgetsRouter) mount() {
@@ -241,8 +244,6 @@ func (router *widgetsRouter) mount() {
 }
 
 func (router *widgetsRouter) parsePostClassicWidgetsRequest(r *http.Request) (request PostClassicWidgetsRequest) {
-	request.ProcessingResult = RequestProcessingResult{typee: ParseSucceed}
-
 	var (
 		body      CreateWidgetRequest
 		decodeErr error
@@ -273,12 +274,11 @@ func (router *widgetsRouter) parsePostClassicWidgetsRequest(r *http.Request) (re
 
 func (router *widgetsRouter) PostClassicWidgets(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	respond(w, r, router.hooks, "PostClassicWidgets", router.service.PostClassicWidgets(r.Context(), router.parsePostClassicWidgetsRequest(r)), true)
+	result := router.service.PostClassicWidgets(r.Context(), router.parsePostClassicWidgetsRequest(r))
+	respond(w, r, router.hooks, "PostClassicWidgets", result.inner(), true)
 }
 
 func (router *widgetsRouter) parsePostWidgetsRequest(r *http.Request) (request PostWidgetsRequest) {
-	request.ProcessingResult = RequestProcessingResult{typee: ParseSucceed}
-
 	var (
 		body      CreateWidgetRequest
 		decodeErr error
@@ -309,11 +309,11 @@ func (router *widgetsRouter) parsePostWidgetsRequest(r *http.Request) (request P
 
 func (router *widgetsRouter) PostWidgets(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	respond(w, r, router.hooks, "PostWidgets", router.service.PostWidgets(r.Context(), router.parsePostWidgetsRequest(r)), true)
+	result := router.service.PostWidgets(r.Context(), router.parsePostWidgetsRequest(r))
+	respond(w, r, router.hooks, "PostWidgets", &result.response, true)
 }
 
 func (router *widgetsRouter) parseGetWidgetsEchoRequest(r *http.Request) (request GetWidgetsEchoRequest) {
-	request.ProcessingResult = RequestProcessingResult{typee: ParseSucceed}
 
 	router.hooks.RequestParseCompleted(r, "GetWidgetsEcho")
 
@@ -322,11 +322,11 @@ func (router *widgetsRouter) parseGetWidgetsEchoRequest(r *http.Request) (reques
 
 func (router *widgetsRouter) GetWidgetsEcho(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	respond(w, r, router.hooks, "GetWidgetsEcho", router.service.GetWidgetsEcho(r.Context(), router.parseGetWidgetsEchoRequest(r)), true)
+	result := router.service.GetWidgetsEcho(r.Context(), router.parseGetWidgetsEchoRequest(r))
+	respond(w, r, router.hooks, "GetWidgetsEcho", &result.response, true)
 }
 
 func (router *widgetsRouter) parseGetWidgetsMultiRequest(r *http.Request) (request GetWidgetsMultiRequest) {
-	request.ProcessingResult = RequestProcessingResult{typee: ParseSucceed}
 
 	router.hooks.RequestParseCompleted(r, "GetWidgetsMulti")
 
@@ -335,11 +335,11 @@ func (router *widgetsRouter) parseGetWidgetsMultiRequest(r *http.Request) (reque
 
 func (router *widgetsRouter) GetWidgetsMulti(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	respond(w, r, router.hooks, "GetWidgetsMulti", router.service.GetWidgetsMulti(r.Context(), router.parseGetWidgetsMultiRequest(r)), true)
+	result := router.service.GetWidgetsMulti(r.Context(), router.parseGetWidgetsMultiRequest(r))
+	respond(w, r, router.hooks, "GetWidgetsMulti", &result.response, true)
 }
 
 func (router *widgetsRouter) parseGetWidgetsRedirectRequest(r *http.Request) (request GetWidgetsRedirectRequest) {
-	request.ProcessingResult = RequestProcessingResult{typee: ParseSucceed}
 
 	router.hooks.RequestParseCompleted(r, "GetWidgetsRedirect")
 
@@ -348,16 +348,16 @@ func (router *widgetsRouter) parseGetWidgetsRedirectRequest(r *http.Request) (re
 
 func (router *widgetsRouter) GetWidgetsRedirect(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	respond(w, r, router.hooks, "GetWidgetsRedirect", router.service.GetWidgetsRedirect(r.Context(), router.parseGetWidgetsRedirectRequest(r)), true)
+	result := router.service.GetWidgetsRedirect(r.Context(), router.parseGetWidgetsRedirectRequest(r))
+	respond(w, r, router.hooks, "GetWidgetsRedirect", &result.response, true)
 }
 
 func (router *widgetsRouter) parseGetWidgetsSecureRequest(r *http.Request) (request GetWidgetsSecureRequest) {
-	request.ProcessingResult = RequestProcessingResult{typee: ParseSucceed}
 
-	results, passed := extractSecurity(r, router.hooks, "GetWidgetsSecure", [][]securityProcessor{{router.securityHandlers[SecuritySchemeBearer]}}, false)
+	results, passed := extractSecurity(r, router.hooks, "GetWidgetsSecure", router.getWidgetsSecureSecurityReqs, false)
 	request.SecurityCheckResults = results
 	if !passed {
-		err := fmt.Errorf("failed passing security checks")
+		err := errFailedPassingSecurityChecks
 		request.ProcessingResult = RequestProcessingResult{error: err, typee: SecurityParseFailed}
 		router.hooks.RequestSecurityParseFailed(r, "GetWidgetsSecure", request.ProcessingResult)
 		return
@@ -371,7 +371,8 @@ func (router *widgetsRouter) parseGetWidgetsSecureRequest(r *http.Request) (requ
 
 func (router *widgetsRouter) GetWidgetsSecure(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	respond(w, r, router.hooks, "GetWidgetsSecure", router.service.GetWidgetsSecure(r.Context(), router.parseGetWidgetsSecureRequest(r)), true)
+	result := router.service.GetWidgetsSecure(r.Context(), router.parseGetWidgetsSecureRequest(r))
+	respond(w, r, router.hooks, "GetWidgetsSecure", &result.response, true)
 }
 
 type response struct {
@@ -385,13 +386,7 @@ type response struct {
 }
 
 type responseInterface interface {
-	statusCode() int
-	body() interface{}
-	bodyRaw() []byte
-	contentType() string
-	redirectURL() string
-	cookies() []http.Cookie
-	headers() map[string]string
+	inner() *response
 }
 
 var (
@@ -401,21 +396,21 @@ var (
 	_ = fmt.Sprint
 )
 
-func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, response responseInterface, hasContent bool) {
-	for header, value := range response.headers() {
+func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, resp *response, hasContent bool) {
+	for header, value := range resp.headers {
 		w.Header().Set(header, value)
 	}
 
-	for _, c := range response.cookies() {
-		cookie := c
-		http.SetCookie(w, &cookie)
+	cookies := resp.cookies
+	for i := range cookies {
+		http.SetCookie(w, &cookies[i])
 	}
 
-	if url := response.redirectURL(); url != "" {
-		switch response.statusCode() {
+	if url := resp.redirectURL; url != "" {
+		switch resp.statusCode {
 		case 301, 302, 303, 307, 308:
 			hooks.RequestRedirectStarted(r, name, url)
-			http.Redirect(w, r, url, response.statusCode())
+			http.Redirect(w, r, url, resp.statusCode)
 			hooks.ServiceCompleted(r, name)
 			return
 		}
@@ -424,42 +419,42 @@ func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, 
 	hooks.RequestProcessingCompleted(r, name)
 
 	if !hasContent {
-		w.WriteHeader(response.statusCode())
+		w.WriteHeader(resp.statusCode)
 		hooks.ServiceCompleted(r, name)
 		return
 	}
 
-	if ct := response.contentType(); ct != "" {
-		w.Header().Set("content-type", ct)
+	if ct := resp.contentType; ct != "" {
+		w.Header().Set("Content-Type", ct)
 	}
 
-	w.WriteHeader(response.statusCode())
+	w.WriteHeader(resp.statusCode)
 
 	var body []byte
-	if response.body() != nil {
+	if resp.body != nil {
 		var err error
-		switch response.contentType() {
+		switch resp.contentType {
 		case "application/xml":
-			body, err = xml.Marshal(response.body())
+			body, err = xml.Marshal(resp.body)
 		case "application/octet-stream":
 			var ok bool
-			if body, ok = (response.body()).([]byte); !ok {
+			if body, ok = (resp.body).([]byte); !ok {
 				err = errors.New("body is not []byte")
 			}
 		case "text/html":
-			body = []byte(fmt.Sprint(response.body()))
+			body = []byte(fmt.Sprint(resp.body))
 		case "application/json":
 			fallthrough
 		default:
-			body, err = json.Marshal(response.body())
+			body, err = json.Marshal(resp.body)
 		}
 		if err != nil {
 			hooks.ResponseBodyMarshalFailed(w, r, name, err)
 			return
 		}
 		hooks.ResponseBodyMarshalCompleted(r, name)
-	} else if len(response.bodyRaw()) > 0 {
-		body = response.bodyRaw()
+	} else if len(resp.bodyRaw) > 0 {
+		body = resp.bodyRaw
 	}
 
 	if len(body) > 0 {
@@ -484,34 +479,10 @@ type postClassicWidgetsResponse struct {
 	response
 }
 
-func (postClassicWidgetsResponse) postClassicWidgetsResponse() {}
+func (*postClassicWidgetsResponse) postClassicWidgetsResponse() {}
 
-func (response postClassicWidgetsResponse) statusCode() int {
-	return response.response.statusCode
-}
-
-func (response postClassicWidgetsResponse) body() interface{} {
-	return response.response.body
-}
-
-func (response postClassicWidgetsResponse) bodyRaw() []byte {
-	return response.response.bodyRaw
-}
-
-func (response postClassicWidgetsResponse) contentType() string {
-	return response.response.contentType
-}
-
-func (response postClassicWidgetsResponse) redirectURL() string {
-	return response.response.redirectURL
-}
-
-func (response postClassicWidgetsResponse) headers() map[string]string {
-	return response.response.headers
-}
-
-func (response postClassicWidgetsResponse) cookies() []http.Cookie {
-	return response.response.cookies
+func (r *postClassicWidgetsResponse) inner() *response {
+	return &r.response
 }
 
 type postClassicWidgetsStatusCodeResponseBuilder struct {
@@ -537,7 +508,7 @@ type PostClassicWidgets200ApplicationJsonResponseBuilder struct {
 }
 
 func (builder *PostClassicWidgets200ApplicationJsonResponseBuilder) Build() PostClassicWidgetsResponse {
-	return postClassicWidgetsResponse{response: builder.response}
+	return &postClassicWidgetsResponse{response: builder.response}
 }
 
 func (builder *postClassicWidgets200ContentTypeBuilder) ApplicationJson() *postClassicWidgets200ApplicationJsonBodyBuilder {
@@ -587,7 +558,7 @@ type PostClassicWidgets400ApplicationJsonResponseBuilder struct {
 }
 
 func (builder *PostClassicWidgets400ApplicationJsonResponseBuilder) Build() PostClassicWidgetsResponse {
-	return postClassicWidgetsResponse{response: builder.response}
+	return &postClassicWidgetsResponse{response: builder.response}
 }
 
 func (builder *postClassicWidgets400ContentTypeBuilder) ApplicationJson() *postClassicWidgets400ApplicationJsonBodyBuilder {
@@ -637,7 +608,7 @@ type PostClassicWidgets500ApplicationJsonResponseBuilder struct {
 }
 
 func (builder *PostClassicWidgets500ApplicationJsonResponseBuilder) Build() PostClassicWidgetsResponse {
-	return postClassicWidgetsResponse{response: builder.response}
+	return &postClassicWidgetsResponse{response: builder.response}
 }
 
 func (builder *postClassicWidgets500ContentTypeBuilder) ApplicationJson() *postClassicWidgets500ApplicationJsonBodyBuilder {
@@ -754,13 +725,11 @@ type Response[B any] struct {
 	response
 }
 
-func (r *Response[B]) statusCode() int            { return r.response.statusCode }
-func (r *Response[B]) body() interface{}          { return r.response.body }
-func (r *Response[B]) bodyRaw() []byte            { return r.response.bodyRaw }
-func (r *Response[B]) contentType() string        { return r.response.contentType }
-func (r *Response[B]) redirectURL() string        { return r.response.redirectURL }
-func (r *Response[B]) headers() map[string]string { return r.response.headers }
-func (r *Response[B]) cookies() []http.Cookie     { return r.response.cookies }
+// inner satisfies responseInterface so generic-mode responses can be passed
+// to respond via a single-method indirection if ever needed. In practice the
+// per-operation wrapper accesses &result.response directly, bypassing the
+// interface for zero dispatch overhead.
+func (r *Response[B]) inner() *response { return &r.response }
 
 type ResponseBuilder[B any] struct {
 	response

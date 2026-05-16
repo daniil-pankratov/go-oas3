@@ -50,7 +50,13 @@ func (config *Config) Headers() (http.Header, error) {
 }
 
 type Configurator struct {
-	config *Config `di.inject:"config"`
+	config *Config
+}
+
+// New wires the configurator with the supplied config holder. The config is
+// populated by LoadFlags() — call it before reading any field.
+func New(config *Config) *Configurator {
+	return &Configurator{config: config}
 }
 
 func (configurator *Configurator) concatPaths(filePath string) (string, error) {
@@ -66,7 +72,10 @@ func (configurator *Configurator) concatPaths(filePath string) (string, error) {
 	return filePath, nil
 }
 
-func (configurator *Configurator) PostConstruct() (err error) {
+// LoadFlags parses CLI flags into the config holder and applies derived
+// defaults (component package/path fall back to the main package/path). Must
+// be called once before downstream code reads from Config.
+func (configurator *Configurator) LoadFlags() (err error) {
 	if err := confita.NewLoader(flags.NewBackend()).Load(context.Background(), configurator.config); err != nil {
 		return err
 	}

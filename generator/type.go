@@ -66,8 +66,8 @@ func parseExtensionBool(ext any) bool {
 }
 
 type Type struct {
-	normalizer *Normalizer          `di.inject:"normalizer"`
-	config     *configurator.Config `di.inject:"config"`
+	normalizer *Normalizer
+	config     *configurator.Config
 }
 
 func (typ *Type) fillJsonTag(into *jen.Statement, schemaRef *openapi3.SchemaRef, name string) {

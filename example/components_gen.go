@@ -4,7 +4,7 @@ package example
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	validation "github.com/go-ozzo/ozzo-validation/v4"
 	uuid "github.com/google/uuid"
 	countries "github.com/mikekonan/go-types/v2/country"
@@ -17,6 +17,20 @@ import (
 )
 
 var regexParamRegex = regexp.MustCompile("^[.?\\d]+$")
+
+var (
+	errCallbackTypeIsEmpty                       = errors.New("callbackType is empty")
+	errDescriptionIsRequired                     = errors.New("Description is required")
+	errFailedPassingSecurityChecks               = errors.New("failed passing security checks")
+	errInvalidGenericResponseResultEnumEnumValue = errors.New("invalid GenericResponseResultEnum enum value")
+	errInvalidWithEnumEnumValue                  = errors.New("invalid WithEnum enum value")
+	errRegexParamIsEmpty                         = errors.New("regexParam is empty")
+	errRegexParamNotMatchedByTheDRegex           = errors.New("RegexParam not matched by the '^[.?\\d]+$' regex")
+	errRegexParamNotMatchedByTheDRegex10         = errors.New("regexParam not matched by the '^[.?\\d]+$' regex")
+	errUuidIsEmpty                               = errors.New("uuid is empty")
+	errXFingerprintIsEmpty                       = errors.New("x-fingerprint is empty")
+	errXFingerprintNotMatchedByThe09aFAFRegex    = errors.New("x-fingerprint not matched by the '[0-9a-fA-F]+' regex")
+)
 
 type Boolean = bool
 
@@ -62,14 +76,14 @@ func (body *CreateTransactionRequest) UnmarshalJSON(data []byte) error {
 	body.Details = value.Details
 	body.Email = value.Email
 	if !regexParamRegex.MatchString(body.RegexParam) {
-		return fmt.Errorf("RegexParam not matched by the '^[.?\\d]+$' regex")
+		return errRegexParamNotMatchedByTheDRegex
 	}
 	body.RegexParam = value.RegexParam
 	body.Title = strings.TrimSpace(value.Title)
 	body.TransactionID = value.TransactionID
 
 	if value.Description == nil {
-		return fmt.Errorf("Description is required")
+		return errDescriptionIsRequired
 	}
 
 	body.Description = strings.TrimSpace(*value.Description)
@@ -79,6 +93,7 @@ func (body *CreateTransactionRequest) UnmarshalJSON(data []byte) error {
 func (body CreateTransactionRequest) Validate() error {
 	return validation.ValidateStruct(&body,
 		validation.Field(&body.Amount, validation.Min(0.009).Exclusive()),
+		validation.Field(&body.AmountCents, validation.Max(100)),
 		validation.Field(&body.Country, validation.Skip.When(body.Country == ""), validation.RuneLength(2, 2)),
 		validation.Field(&body.Currency, validation.Skip.When(body.Currency == ""), validation.RuneLength(3, 3)),
 		validation.Field(&body.Title, validation.Skip.When(body.Title == ""), validation.RuneLength(8, 50)),
@@ -139,7 +154,7 @@ func (body *UpdateTransactionRequest) UnmarshalJSON(data []byte) error {
 	body.Title = strings.TrimSpace(value.Title)
 
 	if value.Description == nil {
-		return fmt.Errorf("Description is required")
+		return errDescriptionIsRequired
 	}
 
 	body.Description = strings.TrimSpace(*value.Description)
@@ -228,7 +243,7 @@ func (enum GenericResponseResultEnum) Check() error {
 		return nil
 	}
 
-	return fmt.Errorf("invalid GenericResponseResultEnum enum value")
+	return errInvalidGenericResponseResultEnumEnumValue
 }
 
 func (enum *GenericResponseResultEnum) UnmarshalJSON(data []byte) error {
@@ -259,7 +274,7 @@ func (enum WithEnum) Check() error {
 		return nil
 	}
 
-	return fmt.Errorf("invalid WithEnum enum value")
+	return errInvalidWithEnumEnumValue
 }
 
 func (enum *WithEnum) UnmarshalJSON(data []byte) error {

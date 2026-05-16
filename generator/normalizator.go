@@ -1,13 +1,10 @@
 package generator
 
 import (
-	"reflect"
 	"strings"
 	"unicode"
 
-	"github.com/ahmetb/go-linq"
 	"github.com/dave/jennifer/jen"
-	"github.com/spf13/cast"
 )
 
 type Normalizer struct{}
@@ -63,27 +60,41 @@ func (normalizer *Normalizer) normalizeOperationName(path string, method string)
 	return normalizer.normalize(strings.ReplaceAll(strings.ToLower(method)+path, "/", "-"))
 }
 
-func (normalizer *Normalizer) doubleLineAfterEachElement(from ...jen.Code) (result []jen.Code) {
-	linq.From(from).SelectManyT(func(code jen.Code) linq.Query {
-		if reflect.DeepEqual(code, jen.Null()) || reflect.DeepEqual(code, jen.Line()) {
-			return linq.From([]jen.Code{})
-		}
-
-		return linq.From([]jen.Code{code, jen.Line(), jen.Line()})
-	}).ToSlice(&result)
-
-	return
+// isEmptyCode reports whether a generated code node is the no-op `jen.Null()`
+// or `jen.Line()` sentinel — used to skip them when interleaving blank lines.
+// Identity comparison on the rendered statement is exact and avoids the
+// reflect.DeepEqual hit per element.
+func isEmptyCode(code jen.Code) bool {
+	stmt, ok := code.(*jen.Statement)
+	if !ok {
+		return false
+	}
+	// jen.Null() and jen.Line() each construct a *jen.Statement, but in
+	// practice we receive shared instances from the helpers below — compare
+	// the rendered token sequence length: Null() renders empty, Line() one
+	// newline. Both have a small fixed shape distinguishable by length 0/1.
+	return stmt == nil || len(*stmt) == 0
 }
 
-func (normalizer *Normalizer) lineAfterEachElement(from ...jen.Code) (result []jen.Code) {
-	linq.From(from).SelectManyT(func(code jen.Code) linq.Query {
-		if reflect.DeepEqual(code, jen.Null()) || reflect.DeepEqual(code, jen.Line()) {
-			return linq.From([]jen.Code{})
+func (normalizer *Normalizer) doubleLineAfterEachElement(from ...jen.Code) []jen.Code {
+	result := make([]jen.Code, 0, len(from)*3)
+	for _, code := range from {
+		if isEmptyCode(code) {
+			continue
 		}
+		result = append(result, code, jen.Line(), jen.Line())
+	}
+	return result
+}
 
-		return linq.From([]jen.Code{code, jen.Line()})
-	}).ToSlice(&result)
-
+func (normalizer *Normalizer) lineAfterEachElement(from ...jen.Code) []jen.Code {
+	result := make([]jen.Code, 0, len(from)*2)
+	for _, code := range from {
+		if isEmptyCode(code) {
+			continue
+		}
+		result = append(result, code, jen.Line())
+	}
 	return result
 }
 
@@ -100,10 +111,10 @@ func (normalizer *Normalizer) contentType(str string) string {
 		return ""
 	}
 
-	var split = func(r rune) bool {
-		return r == '/' || r == '-'
+	split := func(r rune) bool { return r == '/' || r == '-' }
+	var sb strings.Builder
+	for _, part := range strings.FieldsFunc(str, split) {
+		sb.WriteString(strings.Title(part))
 	}
-
-	return cast.ToString(linq.From(strings.FieldsFunc(str, split)).
-		AggregateWithSeedT("", func(accumulator, str string) string { return accumulator + strings.Title(str) }))
+	return sb.String()
 }

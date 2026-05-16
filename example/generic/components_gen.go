@@ -4,8 +4,16 @@ package generic
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	validation "github.com/go-ozzo/ozzo-validation/v4"
+)
+
+var (
+	errCodeIsRequired              = errors.New("code is required")
+	errFailedPassingSecurityChecks = errors.New("failed passing security checks")
+	errIdIsRequired                = errors.New("id is required")
+	errMessageIsRequired           = errors.New("message is required")
+	errNameIsRequired              = errors.New("name is required")
 )
 
 type createWidgetRequest struct {
@@ -23,7 +31,7 @@ func (body *CreateWidgetRequest) UnmarshalJSON(data []byte) error {
 	}
 
 	if value.Name == nil {
-		return fmt.Errorf("name is required")
+		return errNameIsRequired
 	}
 
 	body.Name = *value.Name
@@ -52,13 +60,13 @@ func (body *ErrorBody) UnmarshalJSON(data []byte) error {
 	}
 
 	if value.Code == nil {
-		return fmt.Errorf("code is required")
+		return errCodeIsRequired
 	}
 
 	body.Code = *value.Code
 
 	if value.Message == nil {
-		return fmt.Errorf("message is required")
+		return errMessageIsRequired
 	}
 
 	body.Message = *value.Message
@@ -86,13 +94,13 @@ func (body *Widget) UnmarshalJSON(data []byte) error {
 	}
 
 	if value.ID == nil {
-		return fmt.Errorf("id is required")
+		return errIdIsRequired
 	}
 
 	body.ID = *value.ID
 
 	if value.Name == nil {
-		return fmt.Errorf("name is required")
+		return errNameIsRequired
 	}
 
 	body.Name = *value.Name
