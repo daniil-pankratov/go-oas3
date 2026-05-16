@@ -10,8 +10,18 @@ import (
 	"fmt"
 	chi "github.com/go-chi/chi/v5"
 	"net/http"
+	"reflect"
 )
 
+// Hooks are observability callbacks fired by the generated routing layer.
+// Any field may be left nil — ensureHooks() at handler-init time fills the
+// nil entries with no-op stubs, so call sites never need to nil-check.
+//
+// Contract: hooks are for observability (logging, metrics, tracing). The
+// runtime owns the response. ResponseBodyMarshalFailed receives an
+// http.ResponseWriter for inspection only — the runtime calls http.Error
+// immediately after the hook returns, so writing to w from the hook will
+// produce a duplicate-WriteHeader warning. Read headers/r.Context() at most.
 type Hooks struct {
 	RequestSecurityParseFailed    func(*http.Request, string, RequestProcessingResult)
 	RequestSecurityParseCompleted func(*http.Request, string)
@@ -167,7 +177,15 @@ func extractSecurity(
 		if linkedChecksValid {
 			return results, true, nil
 		}
-		checkErr = attemptCheckErr
+		// Preserve the first real handle() error across OR-branches. A later
+		// branch that fails only on extract (isExtracted=false → attemptCheckErr
+		// stays nil) must NOT overwrite a real auth-handler error from an
+		// earlier branch — otherwise the caller misclassifies the failure as
+		// SecurityParseFailed ("no credentials") and loses the underlying
+		// error that RequestSecurityCheckFailed already reported.
+		if checkErr == nil {
+			checkErr = attemptCheckErr
+		}
 	}
 	return results, false, checkErr
 }
@@ -208,6 +226,22 @@ func (r RequestProcessingResult) Err() error {
 	return r.error
 }
 
+var (
+	_ = reflect.ValueOf
+)
+
+func isNilResponse(v responseInterface) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Chan, reflect.Func, reflect.Map, reflect.Slice:
+		return rv.IsNil()
+	}
+	return false
+}
+
 func DefaultHandler(impl DefaultService, r chi.Router, hooks *Hooks) http.Handler {
 	hooks = ensureHooks(hooks)
 
@@ -237,6 +271,11 @@ func (router *defaultRouter) parseGetTestRequest(r *http.Request) (request GetTe
 func (router *defaultRouter) GetTest(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	result := router.service.GetTest(r.Context(), router.parseGetTestRequest(r))
+	if isNilResponse(result) {
+		router.hooks.ResponseBodyMarshalFailed(w, r, "GetTest", errServiceReturnedANilResponse)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
 	respond(w, r, router.hooks, "GetTest", result.inner(), false)
 }
 
@@ -259,6 +298,7 @@ var (
 	_ = json.Marshal
 	_ = errors.New
 	_ = fmt.Sprint
+	_ = reflect.ValueOf
 )
 
 func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, resp *response, hasContent bool) {
@@ -300,9 +340,19 @@ func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, 
 		case "application/xml":
 			body, err = xml.Marshal(resp.body)
 		case "application/octet-stream":
-			var ok bool
-			if body, ok = (resp.body).([]byte); !ok {
-				err = errors.New("body is not []byte")
+			// Fast path for []byte and its aliases (e.g. type X = []byte).
+			// Fall back to reflect for named types whose underlying type is
+			// []byte (type X []byte) — the plain type assertion above would
+			// fail those since Go checks type identity, not underlying type.
+			if b, ok := (resp.body).([]byte); ok {
+				body = b
+			} else {
+				rv := reflect.ValueOf(resp.body)
+				if rv.Kind() == reflect.Slice && rv.Type().Elem().Kind() == reflect.Uint8 {
+					body = rv.Bytes()
+				} else {
+					err = errors.New("body is not []byte")
+				}
 			}
 		case "text/html":
 			body = []byte(fmt.Sprint(resp.body))

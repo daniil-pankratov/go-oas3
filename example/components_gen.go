@@ -19,17 +19,17 @@ import (
 var regexParamRegex = regexp.MustCompile("^[.?\\d]+$")
 
 var (
-	errCallbackTypeIsEmpty                       = errors.New("callbackType is empty")
-	errDescriptionIsRequired                     = errors.New("Description is required")
-	errFailedPassingSecurityChecks               = errors.New("failed passing security checks")
-	errInvalidGenericResponseResultEnumEnumValue = errors.New("invalid GenericResponseResultEnum enum value")
-	errInvalidWithEnumEnumValue                  = errors.New("invalid WithEnum enum value")
-	errRegexParamIsEmpty                         = errors.New("regexParam is empty")
-	errRegexParamNotMatchedByTheDRegex           = errors.New("RegexParam not matched by the '^[.?\\d]+$' regex")
-	errRegexParamNotMatchedByTheDRegex1          = errors.New("regexParam not matched by the '^[.?\\d]+$' regex")
-	errUUIDIsEmpty                               = errors.New("uuid is empty")
-	errXFingerprintIsEmpty                       = errors.New("x-fingerprint is empty")
-	errXFingerprintNotMatchedByThe09aFAFRegex    = errors.New("x-fingerprint not matched by the '[0-9a-fA-F]+' regex")
+	errCallbackTypeIsEmpty                           = errors.New("callbackType is empty")
+	errFailedPassingSecurityChecks                   = errors.New("failed passing security checks")
+	errFieldDescriptionIsRequiredButWasNullOrMissing = errors.New("field 'Description' is required but was null or missing")
+	errInvalidGenericResponseResultEnumEnumValue     = errors.New("invalid GenericResponseResultEnum enum value")
+	errInvalidWithEnumEnumValue                      = errors.New("invalid WithEnum enum value")
+	errRegexParamIsEmpty                             = errors.New("regexParam is empty")
+	errRegexParamNotMatchedByTheDRegex               = errors.New("regexParam not matched by the '^[.?\\d]+$' regex")
+	errServiceReturnedANilResponse                   = errors.New("service returned a nil response")
+	errUUIDIsEmpty                                   = errors.New("uuid is empty")
+	errXFingerprintIsEmpty                           = errors.New("x-fingerprint is empty")
+	errXFingerprintNotMatchedByThe09aFAFRegex        = errors.New("x-fingerprint not matched by the '[0-9a-fA-F]+' regex")
 )
 
 type Boolean = bool
@@ -75,15 +75,12 @@ func (body *CreateTransactionRequest) UnmarshalJSON(data []byte) error {
 	body.Currency = value.Currency
 	body.Details = value.Details
 	body.Email = value.Email
-	if !regexParamRegex.MatchString(body.RegexParam) {
-		return errRegexParamNotMatchedByTheDRegex
-	}
 	body.RegexParam = value.RegexParam
 	body.Title = strings.TrimSpace(value.Title)
 	body.TransactionID = value.TransactionID
 
 	if value.Description == nil {
-		return errDescriptionIsRequired
+		return errFieldDescriptionIsRequiredButWasNullOrMissing
 	}
 
 	body.Description = strings.TrimSpace(*value.Description)
@@ -96,6 +93,7 @@ func (body CreateTransactionRequest) Validate() error {
 		validation.Field(&body.AmountCents, validation.Max(100)),
 		validation.Field(&body.Country, validation.Skip.When(body.Country == ""), validation.RuneLength(2, 2)),
 		validation.Field(&body.Currency, validation.Skip.When(body.Currency == ""), validation.RuneLength(3, 3)),
+		validation.Field(&body.RegexParam, validation.Skip.When(body.RegexParam == ""), validation.Match(regexParamRegex)),
 		validation.Field(&body.Title, validation.Skip.When(body.Title == ""), validation.RuneLength(8, 50)),
 		validation.Field(&body.Description, validation.Required, validation.RuneLength(8, 100)))
 }
@@ -154,7 +152,7 @@ func (body *UpdateTransactionRequest) UnmarshalJSON(data []byte) error {
 	body.Title = strings.TrimSpace(value.Title)
 
 	if value.Description == nil {
-		return errDescriptionIsRequired
+		return errFieldDescriptionIsRequiredButWasNullOrMissing
 	}
 
 	body.Description = strings.TrimSpace(*value.Description)
@@ -162,16 +160,16 @@ func (body *UpdateTransactionRequest) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-type getSecureEndpointApplicationjson struct {
+type getSecureEndpoint200ApplicationJson struct {
 	Message string `json:"message"`
 }
 
-type GetSecureEndpointApplicationjson struct {
+type GetSecureEndpoint200ApplicationJson struct {
 	Message string `json:"message"`
 }
 
-func (body *GetSecureEndpointApplicationjson) UnmarshalJSON(data []byte) error {
-	var value getSecureEndpointApplicationjson
+func (body *GetSecureEndpoint200ApplicationJson) UnmarshalJSON(data []byte) error {
+	var value getSecureEndpoint200ApplicationJson
 	if err := json.Unmarshal(data, &value); err != nil {
 		return err
 	}
@@ -180,22 +178,22 @@ func (body *GetSecureEndpointApplicationjson) UnmarshalJSON(data []byte) error {
 
 	return nil
 }
-func (body GetSecureEndpointApplicationjson) Validate() error {
+func (body GetSecureEndpoint200ApplicationJson) Validate() error {
 	return nil
 }
 
-type getSemiSecureEndpointApplicationjson struct {
+type getSemiSecureEndpoint200ApplicationJson struct {
 	ApiKey  string `json:"apiKey"`
 	Message string `json:"message"`
 }
 
-type GetSemiSecureEndpointApplicationjson struct {
+type GetSemiSecureEndpoint200ApplicationJson struct {
 	ApiKey  string `json:"apiKey"`
 	Message string `json:"message"`
 }
 
-func (body *GetSemiSecureEndpointApplicationjson) UnmarshalJSON(data []byte) error {
-	var value getSemiSecureEndpointApplicationjson
+func (body *GetSemiSecureEndpoint200ApplicationJson) UnmarshalJSON(data []byte) error {
+	var value getSemiSecureEndpoint200ApplicationJson
 	if err := json.Unmarshal(data, &value); err != nil {
 		return err
 	}
@@ -205,20 +203,20 @@ func (body *GetSemiSecureEndpointApplicationjson) UnmarshalJSON(data []byte) err
 
 	return nil
 }
-func (body GetSemiSecureEndpointApplicationjson) Validate() error {
+func (body GetSemiSecureEndpoint200ApplicationJson) Validate() error {
 	return nil
 }
 
-type postBearerEndpointApplicationjson struct {
+type postBearerEndpoint200ApplicationJson struct {
 	Message string `json:"message"`
 }
 
-type PostBearerEndpointApplicationjson struct {
+type PostBearerEndpoint200ApplicationJson struct {
 	Message string `json:"message"`
 }
 
-func (body *PostBearerEndpointApplicationjson) UnmarshalJSON(data []byte) error {
-	var value postBearerEndpointApplicationjson
+func (body *PostBearerEndpoint200ApplicationJson) UnmarshalJSON(data []byte) error {
+	var value postBearerEndpoint200ApplicationJson
 	if err := json.Unmarshal(data, &value); err != nil {
 		return err
 	}
@@ -227,7 +225,7 @@ func (body *PostBearerEndpointApplicationjson) UnmarshalJSON(data []byte) error 
 
 	return nil
 }
-func (body PostBearerEndpointApplicationjson) Validate() error {
+func (body PostBearerEndpoint200ApplicationJson) Validate() error {
 	return nil
 }
 

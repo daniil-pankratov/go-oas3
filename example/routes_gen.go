@@ -11,8 +11,9 @@ import (
 	chi "github.com/go-chi/chi/v5"
 	validation "github.com/go-ozzo/ozzo-validation/v4"
 	cast "github.com/spf13/cast"
-	"io/ioutil"
+	"io"
 	"net/http"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -21,6 +22,15 @@ import (
 
 var xFingerprintRegex = regexp.MustCompile("[0-9a-fA-F]+")
 
+// Hooks are observability callbacks fired by the generated routing layer.
+// Any field may be left nil — ensureHooks() at handler-init time fills the
+// nil entries with no-op stubs, so call sites never need to nil-check.
+//
+// Contract: hooks are for observability (logging, metrics, tracing). The
+// runtime owns the response. ResponseBodyMarshalFailed receives an
+// http.ResponseWriter for inspection only — the runtime calls http.Error
+// immediately after the hook returns, so writing to w from the hook will
+// produce a duplicate-WriteHeader warning. Read headers/r.Context() at most.
 type Hooks struct {
 	RequestSecurityParseFailed    func(*http.Request, string, RequestProcessingResult)
 	RequestSecurityParseCompleted func(*http.Request, string)
@@ -176,7 +186,15 @@ func extractSecurity(
 		if linkedChecksValid {
 			return results, true, nil
 		}
-		checkErr = attemptCheckErr
+		// Preserve the first real handle() error across OR-branches. A later
+		// branch that fails only on extract (isExtracted=false → attemptCheckErr
+		// stays nil) must NOT overwrite a real auth-handler error from an
+		// earlier branch — otherwise the caller misclassifies the failure as
+		// SecurityParseFailed ("no credentials") and loses the underlying
+		// error that RequestSecurityCheckFailed already reported.
+		if checkErr == nil {
+			checkErr = attemptCheckErr
+		}
 	}
 	return results, false, checkErr
 }
@@ -215,6 +233,22 @@ func (r RequestProcessingResult) Type() requestProcessingResultType {
 
 func (r RequestProcessingResult) Err() error {
 	return r.error
+}
+
+var (
+	_ = reflect.ValueOf
+)
+
+func isNilResponse(v responseInterface) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Chan, reflect.Func, reflect.Map, reflect.Slice:
+		return rv.IsNil()
+	}
+	return false
 }
 
 func AuthHandler(impl AuthService, r chi.Router, hooks *Hooks, securitySchemas SecuritySchemas) http.Handler {
@@ -285,6 +319,11 @@ func (router *authRouter) parsePostBearerEndpointRequest(r *http.Request) (reque
 func (router *authRouter) PostBearerEndpoint(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	result := router.service.PostBearerEndpoint(r.Context(), router.parsePostBearerEndpointRequest(r))
+	if isNilResponse(result) {
+		router.hooks.ResponseBodyMarshalFailed(w, r, "PostBearerEndpoint", errServiceReturnedANilResponse)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
 	respond(w, r, router.hooks, "PostBearerEndpoint", result.inner(), true)
 }
 
@@ -311,6 +350,11 @@ func (router *authRouter) parseGetSecureEndpointRequest(r *http.Request) (reques
 func (router *authRouter) GetSecureEndpoint(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	result := router.service.GetSecureEndpoint(r.Context(), router.parseGetSecureEndpointRequest(r))
+	if isNilResponse(result) {
+		router.hooks.ResponseBodyMarshalFailed(w, r, "GetSecureEndpoint", errServiceReturnedANilResponse)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
 	respond(w, r, router.hooks, "GetSecureEndpoint", result.inner(), true)
 }
 
@@ -337,6 +381,11 @@ func (router *authRouter) parseGetSemiSecureEndpointRequest(r *http.Request) (re
 func (router *authRouter) GetSemiSecureEndpoint(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	result := router.service.GetSemiSecureEndpoint(r.Context(), router.parseGetSemiSecureEndpointRequest(r))
+	if isNilResponse(result) {
+		router.hooks.ResponseBodyMarshalFailed(w, r, "GetSemiSecureEndpoint", errServiceReturnedANilResponse)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
 	respond(w, r, router.hooks, "GetSemiSecureEndpoint", result.inner(), true)
 }
 
@@ -435,15 +484,11 @@ func (router *callbacksRouter) parsePostCallbacksCallbackTypeRequest(r *http.Req
 		body      RawPayload
 		decodeErr error
 	)
-	var (
-		buf     interface{}
-		ok      bool
-		readErr error
-	)
-	if buf, readErr = ioutil.ReadAll(r.Body); readErr == nil {
-		if body, ok = buf.(RawPayload); !ok {
-			decodeErr = errors.New("body is not []byte")
-		}
+	bodyBytes, readErr := io.ReadAll(r.Body)
+	if readErr != nil {
+		decodeErr = readErr
+	} else {
+		body = RawPayload(bodyBytes)
 	}
 	if decodeErr != nil {
 		request.ProcessingResult = RequestProcessingResult{error: decodeErr, typee: BodyUnmarshalFailed}
@@ -464,6 +509,11 @@ func (router *callbacksRouter) parsePostCallbacksCallbackTypeRequest(r *http.Req
 func (router *callbacksRouter) PostCallbacksCallbackType(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	result := router.service.PostCallbacksCallbackType(r.Context(), router.parsePostCallbacksCallbackTypeRequest(r))
+	if isNilResponse(result) {
+		router.hooks.ResponseBodyMarshalFailed(w, r, "PostCallbacksCallbackType", errServiceReturnedANilResponse)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
 	respond(w, r, router.hooks, "PostCallbacksCallbackType", result.inner(), true)
 }
 
@@ -571,6 +621,11 @@ func (router *transactionsRouter) parsePostTransactionRequest(r *http.Request) (
 func (router *transactionsRouter) PostTransaction(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	result := router.service.PostTransaction(r.Context(), router.parsePostTransactionRequest(r))
+	if isNilResponse(result) {
+		router.hooks.ResponseBodyMarshalFailed(w, r, "PostTransaction", errServiceReturnedANilResponse)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
 	respond(w, r, router.hooks, "PostTransaction", result.inner(), true)
 }
 
@@ -632,6 +687,11 @@ func (router *transactionsRouter) parsePutTransactionRequest(r *http.Request) (r
 func (router *transactionsRouter) PutTransaction(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	result := router.service.PutTransaction(r.Context(), router.parsePutTransactionRequest(r))
+	if isNilResponse(result) {
+		router.hooks.ResponseBodyMarshalFailed(w, r, "PutTransaction", errServiceReturnedANilResponse)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
 	respond(w, r, router.hooks, "PutTransaction", result.inner(), true)
 }
 
@@ -707,7 +767,7 @@ func (router *transactionsRouter) parseDeleteTransactionsUUIDRequest(r *http.Req
 	}
 
 	if !regexParamRegex.MatchString(pathRegexParam) {
-		err := errRegexParamNotMatchedByTheDRegex1
+		err := errRegexParamNotMatchedByTheDRegex
 
 		request.ProcessingResult = RequestProcessingResult{error: err, typee: PathParseFailed}
 		router.hooks.RequestPathParseFailed(r, "DeleteTransactionsUUID", "regexParam", request.ProcessingResult)
@@ -756,6 +816,11 @@ func (router *transactionsRouter) parseDeleteTransactionsUUIDRequest(r *http.Req
 func (router *transactionsRouter) DeleteTransactionsUUID(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	result := router.service.DeleteTransactionsUUID(r.Context(), router.parseDeleteTransactionsUUIDRequest(r))
+	if isNilResponse(result) {
+		router.hooks.ResponseBodyMarshalFailed(w, r, "DeleteTransactionsUUID", errServiceReturnedANilResponse)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
 	respond(w, r, router.hooks, "DeleteTransactionsUUID", result.inner(), true)
 }
 
@@ -778,6 +843,7 @@ var (
 	_ = json.Marshal
 	_ = errors.New
 	_ = fmt.Sprint
+	_ = reflect.ValueOf
 )
 
 func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, resp *response, hasContent bool) {
@@ -819,9 +885,19 @@ func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, 
 		case "application/xml":
 			body, err = xml.Marshal(resp.body)
 		case "application/octet-stream":
-			var ok bool
-			if body, ok = (resp.body).([]byte); !ok {
-				err = errors.New("body is not []byte")
+			// Fast path for []byte and its aliases (e.g. type X = []byte).
+			// Fall back to reflect for named types whose underlying type is
+			// []byte (type X []byte) — the plain type assertion above would
+			// fail those since Go checks type identity, not underlying type.
+			if b, ok := (resp.body).([]byte); ok {
+				body = b
+			} else {
+				rv := reflect.ValueOf(resp.body)
+				if rv.Kind() == reflect.Slice && rv.Type().Elem().Kind() == reflect.Uint8 {
+					body = rv.Bytes()
+				} else {
+					err = errors.New("body is not []byte")
+				}
 			}
 		case "text/html":
 			body = []byte(fmt.Sprint(resp.body))
@@ -1014,7 +1090,7 @@ func (builder *postBearerEndpoint200ApplicationJsonBodyBuilder) BodyBytes(body [
 	return &PostBearerEndpoint200ApplicationJsonResponseBuilder{response: builder.response}
 }
 
-func (builder *postBearerEndpoint200ApplicationJsonBodyBuilder) Body(body PostBearerEndpointApplicationjson) *PostBearerEndpoint200ApplicationJsonResponseBuilder {
+func (builder *postBearerEndpoint200ApplicationJsonBodyBuilder) Body(body PostBearerEndpoint200ApplicationJson) *PostBearerEndpoint200ApplicationJsonResponseBuilder {
 	builder.response.body = body
 
 	return &PostBearerEndpoint200ApplicationJsonResponseBuilder{response: builder.response}
@@ -1204,7 +1280,7 @@ func (builder *getSecureEndpoint200ApplicationJsonBodyBuilder) BodyBytes(body []
 	return &GetSecureEndpoint200ApplicationJsonResponseBuilder{response: builder.response}
 }
 
-func (builder *getSecureEndpoint200ApplicationJsonBodyBuilder) Body(body GetSecureEndpointApplicationjson) *GetSecureEndpoint200ApplicationJsonResponseBuilder {
+func (builder *getSecureEndpoint200ApplicationJsonBodyBuilder) Body(body GetSecureEndpoint200ApplicationJson) *GetSecureEndpoint200ApplicationJsonResponseBuilder {
 	builder.response.body = body
 
 	return &GetSecureEndpoint200ApplicationJsonResponseBuilder{response: builder.response}
@@ -1276,7 +1352,7 @@ func (builder *getSemiSecureEndpoint200ApplicationJsonBodyBuilder) BodyBytes(bod
 	return &GetSemiSecureEndpoint200ApplicationJsonResponseBuilder{response: builder.response}
 }
 
-func (builder *getSemiSecureEndpoint200ApplicationJsonBodyBuilder) Body(body GetSemiSecureEndpointApplicationjson) *GetSemiSecureEndpoint200ApplicationJsonResponseBuilder {
+func (builder *getSemiSecureEndpoint200ApplicationJsonBodyBuilder) Body(body GetSemiSecureEndpoint200ApplicationJson) *GetSemiSecureEndpoint200ApplicationJsonResponseBuilder {
 	builder.response.body = body
 
 	return &GetSemiSecureEndpoint200ApplicationJsonResponseBuilder{response: builder.response}
@@ -1798,8 +1874,8 @@ func (header PostTransactionRequestHeader) GetXSignature() string {
 
 func (header PostTransactionRequestHeader) Validate() error {
 	return validation.ValidateStruct(&header,
-		validation.Field(&header.XFingerprint, validation.Required, validation.RuneLength(32, 32)),
-		validation.Field(&header.XSignature, validation.RuneLength(0, 5)))
+		validation.Field(&header.XFingerprint, validation.Required, validation.RuneLength(32, 32), validation.Match(xFingerprintRegex)),
+		validation.Field(&header.XSignature, validation.Skip.When(header.XSignature == ""), validation.RuneLength(0, 5)))
 }
 
 type PostTransactionRequest struct {
@@ -1823,8 +1899,8 @@ func (header PutTransactionRequestHeader) GetXSignature() string {
 
 func (header PutTransactionRequestHeader) Validate() error {
 	return validation.ValidateStruct(&header,
-		validation.Field(&header.XFingerprint, validation.Required, validation.RuneLength(32, 32)),
-		validation.Field(&header.XSignature, validation.RuneLength(0, 5)))
+		validation.Field(&header.XFingerprint, validation.Required, validation.RuneLength(32, 32), validation.Match(xFingerprintRegex)),
+		validation.Field(&header.XSignature, validation.Skip.When(header.XSignature == ""), validation.RuneLength(0, 5)))
 }
 
 type PutTransactionRequest struct {
@@ -1848,8 +1924,8 @@ func (header DeleteTransactionsUUIDRequestHeader) GetXSignature() string {
 
 func (header DeleteTransactionsUUIDRequestHeader) Validate() error {
 	return validation.ValidateStruct(&header,
-		validation.Field(&header.XFingerprint, validation.Required, validation.RuneLength(32, 32)),
-		validation.Field(&header.XSignature, validation.RuneLength(0, 5)))
+		validation.Field(&header.XFingerprint, validation.Required, validation.RuneLength(32, 32), validation.Match(xFingerprintRegex)),
+		validation.Field(&header.XSignature, validation.Skip.When(header.XSignature == ""), validation.RuneLength(0, 5)))
 }
 
 type DeleteTransactionsUUIDRequestPath struct {
@@ -1867,7 +1943,7 @@ func (path DeleteTransactionsUUIDRequestPath) GetUUID() string {
 
 func (path DeleteTransactionsUUIDRequestPath) Validate() error {
 	return validation.ValidateStruct(&path,
-		validation.Field(&path.RegexParam, validation.Required, validation.RuneLength(5, 0)))
+		validation.Field(&path.RegexParam, validation.Required, validation.RuneLength(5, 0), validation.Match(regexParamRegex)))
 }
 
 type DeleteTransactionsUUIDRequestQuery struct {

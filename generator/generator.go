@@ -3,7 +3,6 @@ package generator
 import (
 	"encoding/json"
 	"fmt"
-	"html"
 	"slices"
 	"strconv"
 	"strings"
@@ -23,9 +22,8 @@ type Generator struct {
 	// optimize code generator for regexp
 	useRegex map[string]string
 
-	// errVars dedupes constant runtime error messages so each unique message
-	// becomes a single package-level `var ... = errors.New(...)` instead of a
-	// fresh fmt.Errorf allocation per call. Keys: errFile{Components,Routes}.
+	// errVars dedupes runtime error messages into package-level vars so each
+	// unique message allocates once, not per call.
 	componentErrVars map[string]string
 	routesErrVars    map[string]string
 }
@@ -37,12 +35,10 @@ const (
 	errFileRoutes
 )
 
-// errVar registers (or reuses) a package-level error variable for msg in the
-// target file and returns its identifier. Same message → same identifier.
-// When components and routes share the same Go package (the default config),
-// both files' errors are coalesced into one map so the emitted var block is
-// declared once and referenced from both files without duplicate-identifier
-// errors at compile time.
+// errVar returns the identifier for the package-level error variable
+// matching msg in the target file, registering a new one on first sight.
+// When components and routes share the same Go package the maps are
+// coalesced so the var block isn't declared twice.
 func (generator *Generator) errVar(msg string, file errFile) string {
 	if generator.errVarsPackagesShared() {
 		file = errFileComponents
@@ -52,11 +48,10 @@ func (generator *Generator) errVar(msg string, file errFile) string {
 		return name
 	}
 	base := buildErrVarName(msg, len(*m))
-	// Guard against name collisions across different messages that normalize
-	// to the same identifier (e.g. "x is required" vs "x_is_required").
-	// Loop with an incrementing suffix until we get an identifier no other
-	// entry already claims — a single check is not enough, the chosen suffix
-	// itself can collide with a previously-generated <name><digits> entry.
+	// Different messages can normalize to the same identifier ("x is required"
+	// vs "x_is_required"). Walk an incrementing suffix until we find one no
+	// other entry claims — a single check isn't enough because the chosen
+	// suffix itself can collide with an earlier <name><digits> entry.
 	used := make(map[string]struct{}, len(*m))
 	for _, existing := range *m {
 		used[existing] = struct{}{}
@@ -72,8 +67,15 @@ func (generator *Generator) errVar(msg string, file errFile) string {
 	return name
 }
 
+// errVarsPackagesShared reports whether components and routes end up in the
+// same Go package — i.e. the same on-disk directory AND the same package
+// identifier. Matching just the package identifier is not enough: two
+// directories that both declare `package gen` are still two distinct Go
+// packages, so coalescing error vars into a single declaration would leave
+// the other file with unresolved references.
 func (generator *Generator) errVarsPackagesShared() bool {
-	return generator.config.ComponentsPackage == generator.config.Package
+	return generator.config.ComponentsPackage == generator.config.Package &&
+		generator.config.ComponentsPath == generator.config.Path
 }
 
 func (generator *Generator) errVarsMap(file errFile) *map[string]string {
@@ -89,10 +91,9 @@ func (generator *Generator) errVarsMap(file errFile) *map[string]string {
 	return &generator.routesErrVars
 }
 
-// errVarsBlock emits a `var (...)` block declaring every registered package-
-// level error variable for the file in deterministic order. When components
-// and routes share a package, the routes-side block is empty — the shared
-// declarations live in components_gen.go and are visible to routes_gen.go.
+// errVarsBlock emits the `var (...)` block of registered errors for file.
+// When components and routes share a package the routes-side block is
+// empty — the declarations live in components_gen.go.
 func (generator *Generator) errVarsBlock(file errFile) jen.Code {
 	if generator.errVarsPackagesShared() && file == errFileRoutes {
 		return jen.Null()
@@ -114,8 +115,7 @@ func (generator *Generator) errVarsBlock(file errFile) jen.Code {
 	return jen.Var().Defs(defs...).Line()
 }
 
-// commonInitialisms — words that should be all-caps when they appear as a
-// standalone word inside a Go identifier, per the Go style guide.
+// commonInitialisms — words emitted all-caps when standalone in an identifier.
 var commonInitialisms = map[string]string{
 	"id":    "ID",
 	"uuid":  "UUID",
@@ -131,10 +131,9 @@ var commonInitialisms = map[string]string{
 	"ip":    "IP",
 }
 
-// buildErrVarName turns a free-form message into a Go identifier prefixed
-// with "err". Non-alphanumeric runes act as word separators; each following
-// word is title-cased, with well-known initialisms (ID, UUID, HTTP, …)
-// emitted in all-caps. Falls back to errN if normalization yields nothing.
+// buildErrVarName turns a message into an err-prefixed Go identifier.
+// Non-alphanumeric runes split words; initialisms render all-caps.
+// Falls back to errN when normalization yields nothing.
 func buildErrVarName(msg string, idx int) string {
 	var sb strings.Builder
 	sb.WriteString("err")
@@ -187,6 +186,18 @@ func NewType(normalizer *Normalizer, config *configurator.Config) *Type {
 	return &Type{normalizer: normalizer, config: config}
 }
 
+// inlineResponseBodyTypeName builds the Go identifier for an inline response
+// body schema. The status code MUST be part of the name: an operation can
+// legally declare different inline schemas under the same content-type for
+// different status codes (e.g. 200/application/json and 400/application/json),
+// and dropping the status would silently coalesce them in components_gen.go.
+// All three callers — components(), builders(), genericResponseBodyTypeName()
+// — share this helper so the emitted struct and the type referenced from the
+// service signature always agree.
+func (generator *Generator) inlineResponseBodyTypeName(operationName, statusCode, contentType string) string {
+	return operationName + statusCode + strings.Title(generator.normalizer.normalize(contentType))
+}
+
 // sortedMapKeys returns sorted keys from any map to ensure deterministic iteration
 func sortedMapKeys[K ~string, V any](m map[K]V) []K {
 	keys := make([]K, 0, len(m))
@@ -203,9 +214,8 @@ type sortedKeyValue[K comparable, V any] struct {
 	Value V
 }
 
-// mustParseStatusCode parses an OpenAPI status-code string (always "100"..."599")
-// into an int. The spec guarantees a valid integer string here; we panic on
-// anything else rather than silently emitting 0 into the generated code.
+// mustParseStatusCode panics on a non-integer status; the spec guarantees
+// "100".."599" here and we'd rather fail loudly than emit 0.
 func mustParseStatusCode(s string) int {
 	n, err := strconv.Atoi(s)
 	if err != nil {
@@ -240,8 +250,8 @@ func (generator *Generator) file(from jen.Code, importPath, packageName string) 
 func (generator *Generator) Generate(swagger *openapi3.T) *Result {
 	componentsAdditionalVars, parametersAdditionalVars := generator.additionalConstants(swagger)
 
-	// Generate bodies first so errVar() registrations are complete before we
-	// emit the `var (...)` block of singleton error values for each file.
+	// Generate bodies first so errVar registrations are complete before
+	// errVarsBlock emits the var declarations.
 	componentsBody := generator.components(swagger)
 	wrappersBody := generator.wrappers(swagger)
 	buildersBody := generator.requestResponseBuilders(swagger)
@@ -258,11 +268,9 @@ func (generator *Generator) Generate(swagger *openapi3.T) *Result {
 		Add(buildersBody).Line().
 		Add(securityBody)
 
-	// Package NAME (the `package X` declaration) is derived from the on-disk
-	// directory basename — Go convention is that a package's name should match
-	// its containing directory, even when the import-path basename differs
-	// (e.g. `api/v1` directory contains `package v1`, but `api/v1/gen` directory
-	// contains `package gen` while still being imported as `api/v1/gen`).
+	// `package X` follows the directory basename, not the import-path basename
+	// — `api/v1/gen` directory is `package gen`, even though Qual imports it
+	// as `api/v1/gen`.
 	routerPkgName := generator.trimPackagePath(generator.config.Path)
 	componentsPkgName := generator.trimPackagePath(generator.config.ComponentsPath)
 
@@ -274,10 +282,6 @@ func (generator *Generator) Generate(swagger *openapi3.T) *Result {
 }
 
 func (generator *Generator) requestParameters(paths map[string]*openapi3.PathItem) jen.Code {
-	// For each path × method, emit one (or more, for multi-content-type)
-	// request struct. Group by tag so identically-tagged operations sit next
-	// to each other in the output. Tag order is lexical; path/method order
-	// inside a tag follows path then method.
 	codeByTag := map[string][]jen.Code{}
 	for _, pathEntry := range sortedMapEntries(paths) {
 		path := pathEntry.Key
@@ -298,7 +302,6 @@ func (generator *Generator) requestParameters(paths map[string]*openapi3.PathIte
 				contentType := sortedMapKeys(operation.RequestBody.Value.Content)[0]
 				opCode = append(opCode, generator.requestParameterStruct(name, contentType, false, operation))
 			default:
-				// One struct per content-type, separated by blank lines.
 				for _, ctEntry := range sortedMapEntries(operation.RequestBody.Value.Content) {
 					opCode = append(opCode, generator.requestParameterStruct(name, ctEntry.Key, true, operation))
 				}
@@ -338,14 +341,10 @@ func (generator *Generator) components(swagger *openapi3.T) jen.Code {
 		componentsResult = append(componentsResult, generator.componentFromSchema(schemaName, schemaRef))
 	}
 
-	// Per-path inline request-body components: a struct gets emitted for each
-	// operation whose RequestBody has at least one inline (non-$ref) content
-	// entry. Single-content-type operations get just <Op>RequestBody; multi-
-	// content-type operations get <Op><ContentType>RequestBody for each.
-	//
-	// Keys are deduplicated by name (a single operation might appear twice via
-	// linq's previous ToMapByT semantics) — we collect into a map first, then
-	// emit in lexical order.
+	// Inline request-body components: one struct per operation that has an
+	// inline (non-$ref) content entry. Single-content-type → <Op>RequestBody;
+	// multi-content-type → <Op><ContentType>RequestBody per entry. Dedupe by
+	// name before emitting so duplicates produce one declaration.
 	componentsByName := map[string]jen.Code{}
 	for _, pathEntry := range sortedMapEntries(swagger.Paths.Map()) {
 		path := pathEntry.Key
@@ -354,7 +353,6 @@ func (generator *Generator) components(swagger *openapi3.T) jen.Code {
 			if operation.RequestBody == nil || len(operation.RequestBody.Value.Content) == 0 {
 				continue
 			}
-			// Only process if at least one content entry is an inline schema.
 			hasInline := false
 			for _, mt := range operation.RequestBody.Value.Content {
 				if mt.Schema.Ref == "" {
@@ -385,9 +383,7 @@ func (generator *Generator) components(swagger *openapi3.T) jen.Code {
 		componentsFromPathsResult = append(componentsFromPathsResult, entry.Value)
 	}
 
-	// Add inline response body components. Walk every map in sorted order
-	// (paths → methods → status codes → content-types) and collect into a
-	// name-keyed map to dedupe + keep emission deterministic across runs.
+	// Inline response-body components: dedupe by name and emit in sorted order.
 	inlineByName := map[string]jen.Code{}
 	for _, pathEntry := range sortedMapEntries(swagger.Paths.Map()) {
 		for _, opEntry := range sortedMapEntries(pathEntry.Value.Operations()) {
@@ -404,7 +400,7 @@ func (generator *Generator) components(swagger *openapi3.T) jen.Code {
 					if ctEntry.Value.Schema.Ref != "" {
 						continue
 					}
-					objName := operationName + strings.Title(generator.normalizer.normalize(ctEntry.Key))
+					objName := generator.inlineResponseBodyTypeName(operationName, respEntry.Key, ctEntry.Key)
 					inlineByName[objName] = generator.componentFromSchema(objName, ctEntry.Value.Schema)
 				}
 			}
@@ -610,9 +606,6 @@ func (generator *Generator) requestParameterStruct(name string, contentType stri
 			parameter{In: "Body", Code: jen.Id("Body").Qual(generator.config.ComponentsPackage, bodyTypeName)})
 	}
 
-	// Group parameters by `in` (header/path/query/cookie), keep parameter
-	// names sorted within each group. Emit one Request<In> struct per group
-	// (with field + Get<Field>() accessors + Validate()).
 	paramsByIn := map[string][]*openapi3.ParameterRef{}
 	for _, p := range operation.Parameters {
 		paramsByIn[p.Value.In] = append(paramsByIn[p.Value.In], p)
@@ -640,21 +633,19 @@ func (generator *Generator) requestParameterStruct(name string, contentType stri
 		for _, parameter := range group {
 			pName := generator.normalizer.normalize(parameter.Value.Name)
 
-			// Struct field.
 			field := jen.Id(pName)
 			if len(parameter.Value.Schema.Value.Enum) > 0 && len(parameter.Value.Schema.Ref) > 0 {
 				generator.typee.fillGoType(field, "", generator.normalizer.extractNameFromRef(parameter.Value.Schema.Ref), parameter.Value.Schema, false, false)
 			} else {
 				generator.typee.fillGoType(field, "", pName, parameter.Value.Schema, false, false)
-				// Header field needs a json tag so ozzo-validation surfaces the
-				// real on-wire header name in error messages.
+				// Header gets a json tag so ozzo-validation reports the on-wire
+				// header name in error messages.
 				if parameter.Value.In == "header" {
 					generator.typee.fillJsonTag(field, parameter.Value.Schema, parameter.Value.Name)
 				}
 			}
 			structFields = append(structFields, field)
 
-			// Getter.
 			fvRule := generator.fieldValidationRuleFromSchema(parameter.Value.In, pName, parameter.Value.Schema, parameter.Value.Required)
 			if fvRule != nil {
 				fieldValidationRules = append(fieldValidationRules, jen.Line().Add(fvRule))
@@ -679,9 +670,6 @@ func (generator *Generator) requestParameterStruct(name string, contentType stri
 				Add(validateFunc))
 	}
 
-	// Build the outer request struct's fields (one per `in` group, plus the
-	// Body field for content-type operations), sorted by `in` (alphabetical)
-	// so the layout matches the original linq output.
 	type inField struct {
 		in   string
 		code jen.Code
@@ -708,9 +696,8 @@ func (generator *Generator) requestParameterStruct(name string, contentType stri
 	hasSecuritySchemas := operation.Security != nil && len(*operation.Security) > 0
 
 	if useGen {
-		// For generic operations: embed RequestMeta (ProcessingResult +
-		// SecurityCheckResults + their accessors) — one struct + two methods
-		// emitted once per package instead of per request type.
+		// Generic operations embed RequestMeta so ProcessingResult and
+		// SecurityCheckResults plus their accessors come from one shared type.
 		parameters = append(parameters, jen.Id("RequestMeta"))
 	} else {
 		parameters = append(parameters, jen.Id("ProcessingResult").Id("RequestProcessingResult"))
@@ -734,9 +721,8 @@ func (generator *Generator) requestParameterStruct(name string, contentType stri
 		Line().Line()
 
 	if useGen {
-		// Only the per-operation accessor: GetHeader(), since Header is a
-		// uniquely-typed struct per operation. ProcessingResult and security
-		// results are reached via the embedded RequestMeta.
+		// GetHeader is per-operation because Header is uniquely typed per
+		// endpoint; the other Request-interface methods come from RequestMeta.
 		result = result.Add(generator.requestHeaderAccessor(name+"Request", hasHeader)).Line().Line()
 	}
 
@@ -815,10 +801,19 @@ func (generator *Generator) enumFromSchema(name string, schema *openapi3.SchemaR
 }
 
 func (generator *Generator) getXGoRegex(schema *openapi3.SchemaRef) string {
-	if len(schema.Value.Extensions) > 0 && schema.Value.Extensions[goRegex] != nil {
-		return parseExtensionString(schema.Value.Extensions[goRegex])
-	}
+	return getXGoRegexFromSchema(schema.Value)
+}
 
+// getXGoRegexFromSchema reads the x-go-regex extension directly off a Schema
+// value, bypassing the SchemaRef wrapper. Useful in code paths that already
+// hold the unwrapped Schema (e.g. fieldValidationRuleFromSchema).
+func getXGoRegexFromSchema(schema *openapi3.Schema) string {
+	if schema == nil {
+		return ""
+	}
+	if len(schema.Extensions) > 0 && schema.Extensions[goRegex] != nil {
+		return parseExtensionString(schema.Extensions[goRegex])
+	}
 	return ""
 }
 
@@ -855,18 +850,34 @@ func (generator *Generator) fieldValidationRuleFromSchema(receiverName string, p
 	}
 
 	if isSchemaType(v.Type, "string") {
-		if v.MaxLength != nil || v.MinLength > 0 {
+		regex := getXGoRegexFromSchema(v)
+		hasLengthRule := v.MaxLength != nil || v.MinLength > 0
+		if hasLengthRule || regex != "" {
 			var maxLength uint64
 			if v.MaxLength != nil {
 				maxLength = *v.MaxLength
 			}
-			var params = []jen.Code{jen.Op("&").Id(receiverName).Dot(propertyName)}
+			params := []jen.Code{jen.Op("&").Id(receiverName).Dot(propertyName)}
 			if v.MinLength > 0 && required {
 				params = append(params, jen.Qual("github.com/go-ozzo/ozzo-validation/v4", "Required"))
-			} else if v.MinLength > 0 {
+			} else if !required {
+				// Optional fields: skip every subsequent rule when the value is
+				// the zero string. ozzo's IsEmpty short-circuit already covers
+				// RuneLength and Match individually, but emitting Skip.When
+				// makes the intent obvious in the generated code and matches
+				// the pre-existing length-only branch's behavior.
 				params = append(params, jen.Qual("github.com/go-ozzo/ozzo-validation/v4", "Skip").Dot("When").Call(jen.Id(receiverName).Dot(propertyName).Op("==").Lit("")))
 			}
-			params = append(params, jen.Qual("github.com/go-ozzo/ozzo-validation/v4", "RuneLength").Call(jen.Lit(int(v.MinLength)), jen.Lit(int(maxLength))))
+			if hasLengthRule {
+				params = append(params, jen.Qual("github.com/go-ozzo/ozzo-validation/v4", "RuneLength").Call(jen.Lit(int(v.MinLength)), jen.Lit(int(maxLength))))
+			}
+			if regex != "" {
+				// Regex belongs in Validate(), not UnmarshalJSON: schema
+				// validation is a separate concern from JSON parsing. The
+				// useRegex map registered the compiled regexp at codegen time,
+				// so we just look up the variable and pass it to validation.Match.
+				params = append(params, jen.Qual("github.com/go-ozzo/ozzo-validation/v4", "Match").Call(jen.Id(generator.useRegex[regex])))
+			}
 			fieldRule = jen.Qual("github.com/go-ozzo/ozzo-validation/v4", "Field").Call(params...)
 		}
 	} else if isSchemaType(v.Type, "integer") || isSchemaType(v.Type, "number") {
@@ -895,6 +906,28 @@ func (generator *Generator) fieldValidationRuleFromSchema(receiverName string, p
 		}
 		if len(rules) > 0 {
 			params := append([]jen.Code{jen.Op("&").Id(receiverName).Dot(propertyName)}, rules...)
+			fieldRule = jen.Qual("github.com/go-ozzo/ozzo-validation/v4", "Field").Call(params...)
+		}
+	} else if isSchemaType(v.Type, "array") {
+		// Arrays: ozzo's validation.Length checks slice length, but it short-
+		// circuits on "empty" values — an empty/nil slice always passes
+		// Length(min,max) regardless of min. To enforce minItems on a required
+		// array we have to pair Length with validation.Required, which is the
+		// rule that actually errors on empty input. Mirror the string handling
+		// above so a required field with a positive lower bound rejects [].
+		if v.MinItems > 0 || v.MaxItems != nil {
+			params := []jen.Code{jen.Op("&").Id(receiverName).Dot(propertyName)}
+			if v.MinItems > 0 && required {
+				params = append(params, jen.Qual("github.com/go-ozzo/ozzo-validation/v4", "Required"))
+			}
+			var maxItems uint64
+			if v.MaxItems != nil {
+				maxItems = *v.MaxItems
+			}
+			params = append(params, jen.Qual("github.com/go-ozzo/ozzo-validation/v4", "Length").Call(
+				jen.Lit(int(v.MinItems)),
+				jen.Lit(int(maxItems)),
+			))
 			fieldRule = jen.Qual("github.com/go-ozzo/ozzo-validation/v4", "Field").Call(params...)
 		}
 	}
@@ -946,30 +979,22 @@ func (generator *Generator) componentFromSchema(name string, parentSchema *opena
 		schema := parentSchema.Value.Properties[property]
 		propertyName := strings.Title(generator.normalizer.normalize(property))
 
-		var additionalValidationCode []jen.Code
-		regex := generator.getXGoRegex(schema)
-		if regex != "" {
-			regexVarName := generator.useRegex[regex]
-			errMsg := fmt.Sprintf(`%s not matched by the '%s' regex`, property, html.EscapeString(regex))
-			additionalValidationCode = append(additionalValidationCode,
-				jen.If(jen.Op("!").Id(regexVarName).Dot("MatchString").Call(jen.Id("body").Dot(propertyName))).Block(
-					jen.Return().Id(generator.errVar(errMsg, errFileComponents))).Line())
-		}
-
+		// Regex validation happens inside Validate() via ozzo's validation.Match
+		// (see fieldValidationRuleFromSchema) — UnmarshalJSON only handles
+		// presence/absence and JSON well-formedness so a malformed payload and a
+		// schema-invalid payload surface through different error paths.
 		fvRule := generator.fieldValidationRuleFromSchema("body", propertyName, schema, false)
 		if fvRule != nil {
 			fieldValidationRules = append(fieldValidationRules, jen.Line().Add(fvRule))
 		}
 
-		var generateStatement = jen.Null().Add(additionalValidationCode...)
-
 		isTrimmable := generator.getXGoStringTrimmable(schema)
 		if isTrimmable {
 			unmarshalNonRequiredAssignments = append(unmarshalNonRequiredAssignments,
-				generateStatement.Id("body").Dot(propertyName).Op("=").Qual("strings", "TrimSpace").Call(jen.Id("value").Dot(propertyName)).Line())
+				jen.Id("body").Dot(propertyName).Op("=").Qual("strings", "TrimSpace").Call(jen.Id("value").Dot(propertyName)).Line())
 		} else {
 			unmarshalNonRequiredAssignments = append(unmarshalNonRequiredAssignments,
-				generateStatement.Id("body").Dot(propertyName).Op("=").Id("value").Dot(propertyName).Line())
+				jen.Id("body").Dot(propertyName).Op("=").Id("value").Dot(propertyName).Line())
 		}
 	}
 
@@ -988,25 +1013,17 @@ func (generator *Generator) componentFromSchema(name string, parentSchema *opena
 		schema := parentSchema.Value.Properties[property]
 		propertyName := strings.Title(generator.normalizer.normalize(property))
 
-		var additionalValidationCode []jen.Code
-		regex := generator.getXGoRegex(schema)
-		if regex != "" {
-			regexVarName := generator.useRegex[regex]
-			errMsg := fmt.Sprintf(`%s not matched by the '%s' regex`, property, html.EscapeString(regex))
-			additionalValidationCode = append(additionalValidationCode,
-				jen.If(jen.Op("!").Id(regexVarName).Dot("MatchString").Call(jen.Op("*").Id("value").Dot(propertyName))).Block(
-					jen.Return().Id(generator.errVar(errMsg, errFileComponents))).Line())
-		}
-
+		// Regex validation happens inside Validate() via ozzo's validation.Match
+		// (see fieldValidationRuleFromSchema) — UnmarshalJSON only handles
+		// presence/absence and JSON well-formedness so a malformed payload and a
+		// schema-invalid payload surface through different error paths.
 		fvRule := generator.fieldValidationRuleFromSchema("body", propertyName, schema, true)
 		if fvRule != nil {
 			fieldValidationRules = append(fieldValidationRules, jen.Line().Add(fvRule))
 		}
 
 		code := jen.If(jen.Id("value").Dot(propertyName).Op("==").Id("nil")).
-			Block(jen.Return().Id(generator.errVar(fmt.Sprintf("%s is required", property), errFileComponents))).
-			Line().Line().
-			Add(additionalValidationCode...).
+			Block(jen.Return().Id(generator.errVar(fmt.Sprintf("field '%s' is required but was null or missing", propertyName), errFileComponents))).
 			Line().Line()
 
 		isTrimmable := generator.getXGoStringTrimmable(schema)
@@ -1247,7 +1264,25 @@ func (generator *Generator) enums(swagger *openapi3.T) jen.Code {
 }
 
 func (generator *Generator) hooksStruct() jen.Code {
-	return jen.Type().Id("Hooks").Struct(
+	return jen.Comment("Hooks are observability callbacks fired by the generated routing layer.").
+		Line().
+		Comment("Any field may be left nil — ensureHooks() at handler-init time fills the").
+		Line().
+		Comment("nil entries with no-op stubs, so call sites never need to nil-check.").
+		Line().
+		Comment("").
+		Line().
+		Comment("Contract: hooks are for observability (logging, metrics, tracing). The").
+		Line().
+		Comment("runtime owns the response. ResponseBodyMarshalFailed receives an").
+		Line().
+		Comment("http.ResponseWriter for inspection only — the runtime calls http.Error").
+		Line().
+		Comment("immediately after the hook returns, so writing to w from the hook will").
+		Line().
+		Comment("produce a duplicate-WriteHeader warning. Read headers/r.Context() at most.").
+		Line().
+		Type().Id("Hooks").Struct(
 		jen.Id("RequestSecurityParseFailed").Func().Params(jen.Op("*").Qual("net/http",
 			"Request"),
 			jen.Id("string"),
@@ -1346,8 +1381,8 @@ func (generator *Generator) requestProcessingResultType() jen.Code {
 	return jen.Type().Id("requestProcessingResultType").Id("uint8").
 		Add(jen.Line(), jen.Line()).
 		Add(jen.Const().Defs(
-			// ParseSucceed is the zero value so a freshly-returned request
-			// doesn't need an explicit assignment in the parser.
+			// ParseSucceed is the zero value so the named-return request
+			// already starts in this state without an explicit assignment.
 			jen.Id("ParseSucceed").Id("requestProcessingResultType").Op("=").Id("iota"),
 			jen.Id("BodyUnmarshalFailed"),
 			jen.Id("BodyValidationFailed"),
@@ -1414,9 +1449,6 @@ func (generator *Generator) wrappers(swagger *openapi3.T) jen.Code {
 			method := generator.normalizer.normalize(strings.Title(strings.ToLower(op.method)))
 			baseName := generator.normalizer.normalizeOperationName(op.path, op.method)
 
-			// Routes: one mount line per (operation × content-type), except
-			// when there's at most one content-type, which uses the unqualified
-			// operation name.
 			if op.operation.RequestBody == nil || len(op.operation.RequestBody.Value.Content) == 1 {
 				routes = append(routes,
 					jen.Id("router").Dot("router").Dot(method).Call(jen.Lit(op.path), jen.Id("router").Dot(baseName)))
@@ -1430,12 +1462,10 @@ func (generator *Generator) wrappers(swagger *openapi3.T) jen.Code {
 				routes = append(routes, jen.Add(generator.normalizer.lineAfterEachElement(routeCodes...)...))
 			}
 
-			// Wrappers: one per (operation × content-type).
 			if op.operation.RequestBody == nil {
 				wrappers = append(wrappers,
 					generator.wrapper(baseName, baseName+"Request", routerName, method, op.path, op.operation, nil, ""))
 			} else if len(op.operation.RequestBody.Value.Content) == 1 {
-				// Pick the single content-type entry deterministically.
 				entries := sortedMapEntries(op.operation.RequestBody.Value.Content)
 				contentType := entries[0].Key
 				requestBody := entries[0].Value.Schema
@@ -1443,8 +1473,6 @@ func (generator *Generator) wrappers(swagger *openapi3.T) jen.Code {
 					generator.wrapper(baseName, baseName+"Request", routerName, method, op.path, op.operation, requestBody, contentType))
 			} else {
 				var wrapperCodes []jen.Code
-				// Original behaviour iterated Content map non-deterministically;
-				// keep semantics but iterate sorted for stable output.
 				for _, ctEntry := range sortedMapEntries(op.operation.RequestBody.Value.Content) {
 					name := baseName + generator.normalizer.contentType(ctEntry.Key)
 					wrapperCodes = append(wrapperCodes,
@@ -1496,7 +1524,7 @@ func (generator *Generator) wrappers(swagger *openapi3.T) jen.Code {
 		))
 	}
 
-	return jen.Null().
+	out := jen.Null().
 		Add(generator.hooksStruct()).
 		Add(jen.Line(), jen.Line()).
 		Add(generator.ensureHooksFunc()).
@@ -1504,23 +1532,61 @@ func (generator *Generator) wrappers(swagger *openapi3.T) jen.Code {
 		Add(generator.extractSecurityFunc()).
 		Add(jen.Line(), jen.Line()).
 		Add(generator.requestProcessingResultType()).
-		Add(jen.Line(), jen.Line()).
+		Add(jen.Line(), jen.Line())
+
+	// isNilResponse is only referenced from classic-mode wrappers, so emit it
+	// once at the top of routes_gen.go whenever any operation is classic.
+	if generator.swaggerHasClassicResponse(swagger) {
+		out = out.Add(generator.isNilResponseFunc()).Add(jen.Line(), jen.Line())
+	}
+
+	return out.
 		Add(generator.normalizer.lineAfterEachElement(results...)...).
 		Add(jen.Line(), jen.Line())
 }
 
-// extractSecurityFunc emits the one-time `extractSecurity` helper that walks
-// the OR-of-AND security requirements matrix for an operation.
-//
-// Return value distinguishes the failure mode so the caller can avoid
-// double-firing hooks:
-//   - passed=true             → at least one OR-branch satisfied; results set.
-//   - passed=false, checkErr non-nil → the final attempt's processor.handle()
-//     returned an error. RequestSecurityCheckFailed has already been fired by
-//     this function with the original error; the caller must NOT fire
-//     RequestSecurityParseFailed for the same event.
-//   - passed=false, checkErr nil → no requirement could be extracted (missing
-//     credentials). Caller fires RequestSecurityParseFailed.
+// swaggerHasClassicResponse reports whether at least one operation uses the
+// classic (non-generic) response interface. Used to gate emission of helpers
+// that are only referenced from classic-mode wrappers.
+func (generator *Generator) swaggerHasClassicResponse(swagger *openapi3.T) bool {
+	for _, pathItem := range swagger.Paths.Map() {
+		for _, op := range pathItem.Operations() {
+			if !generator.useGenerics(op) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isNilResponseFunc emits the one-time isNilResponse helper. The classic-mode
+// wrapper uses it instead of `result == nil` because a typed-nil pointer
+// returned as the per-op response interface is NOT == nil (the interface holds
+// a (type, nil) pair). Reflect drills into the boxed value so both literal nil
+// and typed-nil are caught.
+func (generator *Generator) isNilResponseFunc() jen.Code {
+	const src = `
+func isNilResponse(v responseInterface) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Chan, reflect.Func, reflect.Map, reflect.Slice:
+		return rv.IsNil()
+	}
+	return false
+}
+`
+	imports := jen.Var().Defs(jen.Id("_").Op("=").Qual("reflect", "ValueOf"))
+	return jen.Null().Add(imports).Line().Line().Op(src)
+}
+
+// extractSecurityFunc emits the extractSecurity helper that walks the
+// OR-of-AND security matrix. Return shape: passed=true ⇒ one branch
+// satisfied; passed=false + checkErr ⇒ handle() rejected (hook already
+// fired, caller must NOT fire RequestSecurityParseFailed); passed=false +
+// nil checkErr ⇒ no credentials extracted (caller fires it).
 func (generator *Generator) extractSecurityFunc() jen.Code {
 	const src = `
 func extractSecurity(
@@ -1572,7 +1638,15 @@ func extractSecurity(
 		if linkedChecksValid {
 			return results, true, nil
 		}
-		checkErr = attemptCheckErr
+		// Preserve the first real handle() error across OR-branches. A later
+		// branch that fails only on extract (isExtracted=false → attemptCheckErr
+		// stays nil) must NOT overwrite a real auth-handler error from an
+		// earlier branch — otherwise the caller misclassifies the failure as
+		// SecurityParseFailed ("no credentials") and loses the underlying
+		// error that RequestSecurityCheckFailed already reported.
+		if checkErr == nil {
+			checkErr = attemptCheckErr
+		}
 	}
 	return results, false, checkErr
 }
@@ -1580,15 +1654,14 @@ func extractSecurity(
 	return jen.Op(src)
 }
 
-// hookCall emits a direct hook invocation. ensureHooks fills every nil hook
-// with a no-op stub at handler-init time, so the generated code never needs
-// nil-checks at call sites.
+// hookCall emits an unguarded hook invocation; ensureHooks fills nil hooks
+// with no-op stubs at init time so call sites need no nil-check.
 func (generator *Generator) hookCall(hookName string, args ...jen.Code) jen.Code {
 	return jen.Id("router").Dot("hooks").Dot(hookName).Call(args...)
 }
 
-// ensureHooksFunc emits the one-time ensureHooks helper that turns a nullable
-// *Hooks into one with every field populated by a no-op stub.
+// ensureHooksFunc emits ensureHooks, which fills every nil field with a
+// no-op stub so the rest of the generated code can call hooks unguarded.
 func (generator *Generator) ensureHooksFunc() jen.Code {
 	const src = `
 func ensureHooks(h *Hooks) *Hooks {
@@ -1704,14 +1777,32 @@ func (generator *Generator) wrapper(name string, requestName string, routerName,
 		}
 	}
 
-	// Bind the service result to a local so we can extract *response without
-	// going through responseInterface.statusCode()/body()/... (those methods
-	// no longer exist — respond reads fields directly). For generic mode we
-	// can take &result.response; for classic mode the service returns an
-	// interface, so we call inner() once.
 	funcCode = append(funcCode,
 		jen.Id("result").Op(":=").
 			Id("router").Dot("service").Dot(name).Call(generator.serviceCallParams(name)...),
+	)
+	// A nil service return would NPE on &result.response / result.inner();
+	// surface a 500 with a hook instead. Classic mode goes through
+	// isNilResponse because a typed-nil pointer behind the per-op
+	// responseInterface is NOT == nil.
+	nilResponseErr := generator.errVar("service returned a nil response", errFileRoutes)
+	var nilCheckCond jen.Code
+	if generator.useGenerics(operation) {
+		nilCheckCond = jen.Id("result").Op("==").Nil()
+	} else {
+		nilCheckCond = jen.Id("isNilResponse").Call(jen.Id("result"))
+	}
+	funcCode = append(funcCode,
+		jen.If(nilCheckCond).Block(
+			generator.hookCall("ResponseBodyMarshalFailed",
+				jen.Id("w"), jen.Id("r"), jen.Lit(name), jen.Id(nilResponseErr)),
+			jen.Qual("net/http", "Error").Call(
+				jen.Id("w"),
+				jen.Lit("internal server error"),
+				jen.Qual("net/http", "StatusInternalServerError"),
+			),
+			jen.Return(),
+		),
 	)
 	var respArg jen.Code
 	if generator.useGenerics(operation) {
@@ -1752,7 +1843,6 @@ type operationWithPath struct {
 }
 
 func (generator *Generator) groupedOperations(swagger *openapi3.T) []groupedOperations {
-	// Walk paths (sorted) → operations (sorted) and bucket by primary tag.
 	// "default" stands in for operations without a tag.
 	byTag := map[string][]operationWithPath{}
 	for _, pathEntry := range sortedMapEntries(swagger.Paths.Map()) {
@@ -1789,8 +1879,7 @@ func (generator *Generator) handler(name string, serviceName string, routerName 
 	if hasSchemas {
 		schemasInterfaceParameter = schemasInterfaceParameter.Id("securitySchemas").Id("SecuritySchemas")
 
-		// Collect distinct security scheme names across all operations,
-		// sorted for deterministic codegen.
+		// Distinct security scheme names across operations, sorted.
 		seen := map[string]struct{}{}
 		var names []string
 		for _, op := range operations {
@@ -1827,11 +1916,10 @@ func (generator *Generator) handler(name string, serviceName string, routerName 
 			Values(declarations...)
 	}
 
-	// Per-op [][]securityProcessor — built once now so the hot path doesn't
-	// allocate the outer/inner slice literal on every request.
+	// Pre-build the per-op [][]securityProcessor at handler-init so the hot
+	// path doesn't allocate slice literals on every request.
 	var securityReqsInits []jen.Code
 	if hasSchemas {
-		// Sort operations for deterministic output.
 		ops := append([]operationWithPath(nil), operations...)
 		slices.SortFunc(ops, func(a, b operationWithPath) int {
 			if a.path != b.path {
@@ -1845,11 +1933,9 @@ func (generator *Generator) handler(name string, serviceName string, routerName 
 			}
 			opName := generator.normalizer.normalizeOperationName(op.path, op.method)
 
-			// Build the literal: [][]securityProcessor{{router.securityHandlers[X], ...}, ...}.
 			var reqValues []jen.Code
 			for _, requirement := range *op.operation.Security {
 				var handlerLookups []jen.Code
-				// Deterministic key order within a SecurityRequirement.
 				keys := make([]string, 0, len(requirement))
 				for k := range requirement {
 					keys = append(keys, k)
@@ -1890,10 +1976,8 @@ func (generator *Generator) handler(name string, serviceName string, routerName 
 	return code
 }
 
-// securityReqsFieldName returns the per-operation router field that holds
-// the pre-built [][]securityProcessor for an operation. Computing the slice
-// at handler-init time saves 3 allocations per request: the outer/inner
-// slice literals and the map lookup are gone from the hot path.
+// securityReqsFieldName is the router field holding the pre-built
+// [][]securityProcessor for opName.
 func (generator *Generator) securityReqsFieldName(opName string) string {
 	return generator.normalizer.decapitalize(opName) + "SecurityReqs"
 }
@@ -1908,8 +1992,6 @@ func (generator *Generator) router(routerName string, serviceName string, hasSec
 		fields = append(fields, jen.Id("securityHandlers").Map(jen.Id("SecurityScheme")).Id("securityProcessor"))
 	}
 
-	// Per-op precomputed [][]securityProcessor — populated once in the
-	// <Tag>Handler constructor instead of being built per request.
 	for _, op := range operations {
 		if op.operation.Security == nil || len(*op.operation.Security) == 0 {
 			continue
@@ -1922,9 +2004,6 @@ func (generator *Generator) router(routerName string, serviceName string, hasSec
 }
 
 func (generator *Generator) wrapperRequestParsers(wrapperName string, operation *openapi3.Operation) []jen.Code {
-	// Group parameters by location ("header", "path", "query"), keep original
-	// order within each group, then process groups in lexical order of the
-	// location. Matches linq's GroupBy+OrderBy semantics.
 	type group struct {
 		in    string
 		items []*openapi3.ParameterRef
@@ -1951,8 +2030,8 @@ func (generator *Generator) wrapperRequestParsers(wrapperName string, operation 
 			name := generator.normalizer.normalize(parameter.Value.Name)
 			paramName := in + name
 
-			// allOf flatten: a parameter described via allOf with a $ref gets
-			// rewritten so downstream emitters see the referenced schema.
+			// Flatten allOf-with-$ref into the referenced schema so downstream
+			// emitters see the resolved type directly.
 			if parameter.Value.Schema.Value.AllOf != nil {
 				for _, schema := range parameter.Value.Schema.Value.AllOf {
 					if schema.Ref != "" {
@@ -1978,8 +2057,6 @@ func (generator *Generator) wrapperRequestParsers(wrapperName string, operation 
 			}
 		}
 
-		// After all params of this `in` have been extracted: validate the
-		// sub-struct, then signal completion via the hook.
 		inTitle := strings.Title(g.in)
 		result = append(result,
 			jen.Line().Add(jen.If(jen.Id("err").Op(":=").Id("request").Dot(inTitle).Dot("Validate").Call(),
@@ -2256,23 +2333,19 @@ func (generator *Generator) wrapperBody(method string, path string, contentType 
 				return jen.Id("decodeErr").Op("=").Qual("encoding/xml", "NewDecoder").Call(jen.Id("r").Dot("Body")).Dot("Decode").Call(jen.Op("&").Id("body"))
 
 			case "application/octet-stream":
-				return jen.Add(jen.Var().Defs(
-					jen.Id("buf").Interface(),
-					jen.Id("ok").Bool(),
-					jen.Id("readErr").Error(),
-				),
+				// io.ReadAll returns ([]byte, error). Surface a read error as
+				// the body-unmarshal error (was silently swallowed before) and
+				// convert the bytes through the body type so this works for
+				// both `type X = []byte` aliases and named `type X []byte`.
+				return jen.Add(
+					jen.List(jen.Id("bodyBytes"), jen.Id("readErr")).Op(":=").Qual("io", "ReadAll").Call(jen.Id("r").Dot("Body")),
 					jen.Line(),
-					jen.If(
-						jen.List(jen.Id("buf"), jen.Id("readErr")).Op("=").Qual("io/ioutil", "ReadAll").Call(jen.Id("r").Dot("Body")),
-						jen.Id("readErr").Op("==").Nil(),
-					).Block(
-						jen.If(
-							jen.List(jen.Id("body"), jen.Id("ok")).Op("=").Id("buf").Assert(jen.Qual(generator.config.ComponentsPackage, name)),
-							jen.Op("!").Id("ok"),
-						).Block(
-							jen.Id("decodeErr").Op("=").Qual("errors", "New").Call(jen.Lit("body is not []byte")),
-						),
-					))
+					jen.If(jen.Id("readErr").Op("!=").Nil()).Block(
+						jen.Id("decodeErr").Op("=").Id("readErr"),
+					).Else().Block(
+						jen.Id("body").Op("=").Qual(generator.config.ComponentsPackage, name).Call(jen.Id("bodyBytes")),
+					),
+				)
 			default:
 				return jen.Id("decodeErr").Op("=").Qual("encoding/json", "NewDecoder").Call(jen.Id("r").Dot("Body")).Dot("Decode").Call(jen.Op("&").Id("body"))
 			}
@@ -2315,22 +2388,12 @@ func (generator *Generator) wrapperSecurity(name string, operation *openapi3.Ope
 	}
 
 	skipSecurityCheck := generator.typee.getXGoSkipSecurityCheck(operation)
-
-	// The [][]securityProcessor is precomputed in the <Tag>Handler
-	// constructor (router.<opNameSecurityReqs>), saving 3 allocations per
-	// request: outer slice, inner slice(s), and map lookup.
 	skipCheckLit := jen.Lit(skipSecurityCheck)
-
-	// Single call into the package-level extractSecurity helper, replacing
-	// ~80 lines of inlined loop boilerplate per operation with security.
 	securityFailedErr := generator.errVar("failed passing security checks", errFileRoutes)
 
-	// extractSecurity now returns (results, passed, checkErr). When checkErr
-	// is non-nil the inner processor.handle() failed and RequestSecurityCheckFailed
-	// was already fired with the original error — we propagate that error into
-	// ProcessingResult with SecurityCheckFailed type and skip firing
-	// RequestSecurityParseFailed (which would double-report). When checkErr is
-	// nil and !passed, no extractor matched — fire RequestSecurityParseFailed.
+	// checkErr from extractSecurity carries a handle() failure; the hook for
+	// it was already fired inside extractSecurity, so we only fire
+	// RequestSecurityParseFailed on the no-credentials branch.
 	return jen.Null().
 		Add(jen.Line()).
 		Add(jen.List(jen.Id("results"), jen.Id("passed"), jen.Id("checkErr")).Op(":=").
@@ -2368,15 +2431,10 @@ func (generator *Generator) wrapperSecurity(name string, operation *openapi3.Ope
 		Add(jen.Line())
 }
 func (generator *Generator) wrapperRequestParser(name string, requestName string, routerName, method string, path string, operation *openapi3.Operation, requestBody *openapi3.SchemaRef, contentType string) jen.Code {
-	// ParseSucceed is the zero value of requestProcessingResultType, so the
-	// named-return request already has ProcessingResult.typee == ParseSucceed.
-	// No explicit assignment needed.
 	var funcCode []jen.Code
 
-	// Cache r.URL.Query() once at the top when there are any query parameters
-	// — url.ParseQuery is non-trivial (map alloc + per-key string parsing) and
-	// the per-param `wrapperStr/Integer/Enum/CustomType` emitters use the
-	// pre-parsed `query` local instead of re-calling r.URL.Query() each time.
+	// Cache r.URL.Query() once — url.ParseQuery allocates a map + does per-key
+	// parsing, so calling it per query param adds up on hot paths.
 	hasQueryParam := false
 	for _, p := range operation.Parameters {
 		if p.Value.In == "query" {
@@ -2396,9 +2454,8 @@ func (generator *Generator) wrapperRequestParser(name string, requestName string
 	funcCode = append(funcCode, parsers...)
 	funcCode = append(funcCode, body)
 
-	// Leading blank line before RequestParseCompleted only when something
-	// substantive came before it — otherwise we'd open the function body
-	// with an awkward empty line.
+	// Skip the leading blank line before RequestParseCompleted when the
+	// function body would otherwise open with an empty line.
 	hasPriorContent := hasQueryParam || !isEmptyCode(security) || len(parsers) > 0 || !isEmptyCode(body)
 	hookStmt := generator.hookCall("RequestParseCompleted", jen.Id("r"), jen.Lit(name))
 	if hasPriorContent {
@@ -2437,9 +2494,10 @@ func (generator *Generator) swaggerUsesGenerics(swagger *openapi3.T) bool {
 	return false
 }
 
-// genericResponseBodyTypeName picks the response-body type for the generic
-// signature: the first 2xx response with an application/json schema, or "any"
-// when no body is declared.
+// genericResponseBodyTypeName picks the body type for the generic signature:
+// the first 2xx application/json schema, or "any" if none. Inline schemas
+// MUST share the name produced by inlineResponseBodyTypeName so the
+// signature references a type that components() actually emits.
 func (generator *Generator) genericResponseBodyTypeName(op *openapi3.Operation, opName string) string {
 	if op.Responses == nil {
 		return "any"
@@ -2452,7 +2510,6 @@ func (generator *Generator) genericResponseBodyTypeName(op *openapi3.Operation, 
 			extras = append(extras, status)
 		}
 	}
-	// Sort extras for deterministic codegen — map iteration is not stable.
 	slices.Sort(extras)
 	statusOrder = append(statusOrder, extras...)
 	for _, status := range statusOrder {
@@ -2467,7 +2524,7 @@ func (generator *Generator) genericResponseBodyTypeName(op *openapi3.Operation, 
 		if mt.Schema.Ref != "" {
 			return generator.normalizer.extractNameFromRef(mt.Schema.Ref)
 		}
-		return opName + status + "ApplicationJsonResponseBody"
+		return generator.inlineResponseBodyTypeName(opName, status, "application/json")
 	}
 	return "any"
 }
@@ -2491,9 +2548,8 @@ func (generator *Generator) requestResponseBuilders(swagger *openapi3.T) jen.Cod
 	return jen.Null().Add(result...)
 }
 
-// respondFunc emits the one-time `respond` helper invoked by every wrapper.
-// Takes *response directly (no interface dispatch) — the wrapper emits the
-// right unwrap based on whether the operation uses generic mode or classic.
+// respondFunc emits the respond helper. It takes *response directly; the
+// wrapper unwraps from generic *Response[B] or the classic per-op interface.
 func (generator *Generator) respondFunc() jen.Code {
 	const src = `
 func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, resp *response, hasContent bool) {
@@ -2535,9 +2591,19 @@ func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, 
 		case "application/xml":
 			body, err = xml.Marshal(resp.body)
 		case "application/octet-stream":
-			var ok bool
-			if body, ok = (resp.body).([]byte); !ok {
-				err = errors.New("body is not []byte")
+			// Fast path for []byte and its aliases (e.g. type X = []byte).
+			// Fall back to reflect for named types whose underlying type is
+			// []byte (type X []byte) — the plain type assertion above would
+			// fail those since Go checks type identity, not underlying type.
+			if b, ok := (resp.body).([]byte); ok {
+				body = b
+			} else {
+				rv := reflect.ValueOf(resp.body)
+				if rv.Kind() == reflect.Slice && rv.Type().Elem().Kind() == reflect.Uint8 {
+					body = rv.Bytes()
+				} else {
+					err = errors.New("body is not []byte")
+				}
 			}
 		case "text/html":
 			body = []byte(fmt.Sprint(resp.body))
@@ -2573,13 +2639,14 @@ func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, 
 	hooks.ServiceCompleted(r, name)
 }
 `
-	// Raw-string emit bypasses jennifer's import tracking — declare the stdlib
-	// uses inline so the imports are kept in the generated file.
+	// Raw-string src bypasses jennifer's import tracking; declare the stdlib
+	// uses below so the generated file keeps these imports.
 	imports := jen.Var().Defs(
 		jen.Id("_").Op("=").Qual("encoding/xml", "Marshal"),
 		jen.Id("_").Op("=").Qual("encoding/json", "Marshal"),
 		jen.Id("_").Op("=").Qual("errors", "New"),
 		jen.Id("_").Op("=").Qual("fmt", "Sprint"),
+		jen.Id("_").Op("=").Qual("reflect", "ValueOf"),
 	)
 	return jen.Null().Add(imports).Line().Line().Op(src)
 }
@@ -2675,8 +2742,7 @@ func (generator *Generator) builders(swagger *openapi3.T) (result jen.Code) {
 					mediaType := responseRef.Value.Content[contentType]
 					var structName string
 					if "" == mediaType.Schema.Ref {
-						structName = name
-						structName += strings.Title(generator.normalizer.normalize(contentType))
+						structName = generator.inlineResponseBodyTypeName(name, statusCode, contentType)
 					} else {
 						structName = generator.normalizer.extractNameFromRef(mediaType.Schema.Ref)
 					}
@@ -2799,16 +2865,12 @@ func (generator *Generator) serviceReturnType(op *openapi3.Operation, name strin
 	if body == "any" {
 		return jen.Op("*").Id("Response").Index(jen.Any())
 	}
-	// Body lives in the components package; Qual emits the proper import
-	// alias when -componentsPackage differs from the router package.
+	// Qual handles cross-package import when -componentsPackage differs.
 	return jen.Op("*").Id("Response").Index(jen.Qual(generator.config.ComponentsPackage, body))
 }
 
 func (generator *Generator) handlersInterfaces(swagger *openapi3.T) jen.Code {
-	// One <Tag>Service interface per tag, listing every operation under that
-	// tag. Ops without tags fall under "Default". Within a tag, methods appear
-	// in path/operation order; tags themselves are emitted in lexical order
-	// for determinism.
+	// Ops without tags fall under "Default".
 	methodsByTag := map[string][]jen.Code{}
 	for _, pathEntry := range sortedMapEntries(swagger.Paths.Map()) {
 		path := pathEntry.Key
@@ -2828,7 +2890,6 @@ func (generator *Generator) handlersInterfaces(swagger *openapi3.T) jen.Code {
 				continue
 			}
 
-			// Multiple content-types: one interface method per content-type.
 			for _, ctEntry := range sortedMapEntries(operation.RequestBody.Value.Content) {
 				contentTypedName := name + generator.normalizer.contentType(ctEntry.Key)
 				methodsByTag[tag] = append(methodsByTag[tag],
@@ -2851,10 +2912,8 @@ func (generator *Generator) handlersInterfaces(swagger *openapi3.T) jen.Code {
 }
 
 func (generator *Generator) responseStruct() jen.Code {
-	// responseInterface is single-method (inner) used only by classic-mode
-	// per-op response types so the wrapper can extract *response from the
-	// concrete value behind the per-op interface. Generic mode accesses
-	// &Response[B].response directly without going through this interface.
+	// responseInterface lets the classic-mode wrapper reach *response through
+	// the per-op interface; generic mode reads &Response[B].response directly.
 	return jen.Type().Id("response").Struct(
 		jen.Id("statusCode").Id("int"),
 		jen.Id("body").Interface(),
@@ -2868,9 +2927,8 @@ func (generator *Generator) responseStruct() jen.Code {
 			jen.Id("inner").Params().Op("*").Id("response")))
 }
 
-// genericResponseTypes emits the generic Response[B] / ResponseBuilder[B]
-// types plus the Request interface and RequestMeta struct embedded by every
-// generic XxxRequest. Emitted once per package.
+// genericResponseTypes emits Response[B], ResponseBuilder[B], the Request
+// interface, and RequestMeta — the shared per-package generic-mode types.
 func (generator *Generator) genericResponseTypes() jen.Code {
 	const src = `
 type RequestMeta struct {
@@ -2886,10 +2944,9 @@ func (r RequestMeta) GetSecurityCheckResults() map[SecurityScheme]string {
 	return r.SecurityCheckResults
 }
 
-// Request is implemented by every generated XxxRequest whose operation is
-// marked with x-go-generics. GetProcessingResult and GetSecurityCheckResults
-// are promoted from the embedded RequestMeta; GetHeader is emitted per
-// operation because the Header type is unique per endpoint.
+// Request is implemented by every x-go-generics XxxRequest. The first two
+// methods come from the embedded RequestMeta; GetHeader is per-operation
+// because Header is uniquely typed per endpoint.
 type Request interface {
 	GetProcessingResult() RequestProcessingResult
 	GetSecurityCheckResults() map[SecurityScheme]string
@@ -2904,8 +2961,8 @@ type ResponseBuilder[B any] struct {
 	response
 }
 
-// NewResponse creates a builder for a Response[B]. Content-type defaults to
-// "application/json"; override with ContentType() if needed.
+// NewResponse returns a builder with content-type defaulting to
+// "application/json"; override via ContentType.
 func NewResponse[B any]() *ResponseBuilder[B] {
 	return &ResponseBuilder[B]{response: response{contentType: "application/json"}}
 }
@@ -2920,8 +2977,7 @@ func (b *ResponseBuilder[B]) ContentType(ct string) *ResponseBuilder[B] {
 	return b
 }
 
-// Typed content-type shortcuts. Equivalent to ContentType("application/json")
-// etc. but read more naturally in fluent chains. Add more as needed.
+// Typed content-type shortcuts for fluent chains.
 func (b *ResponseBuilder[B]) ApplicationJson() *ResponseBuilder[B] {
 	b.response.contentType = "application/json"
 	return b
@@ -3007,10 +3063,8 @@ func (generator *Generator) responseType(name string) jen.Code {
 	)
 
 	declaration := jen.Type().Id(decapicalizedName + "Response").Struct(jen.Id("response"))
-	// Marker method + inner() to surface *response for the shared respond
-	// helper. Was 7 accessor methods; collapsed to one to eliminate per-call
-	// interface dispatch in respond. Both methods are pointer-receiver so
-	// the corresponding Build() returns *<type> (no struct copy/escape).
+	// Pointer receivers on both methods so Build returns *<type> and the
+	// methods are present in the value's method set.
 	interfaceImplementation := jen.Func().Params(jen.Op("*").Id(decapicalizedName+"Response")).Id(decapicalizedName+"Response").Params().Block().
 		Add(jen.Line(), jen.Line()).
 		Add(jen.Func().Params(
@@ -3225,11 +3279,10 @@ func (generator *Generator) responseCookiesBuilder(cookieBuilderName string, nex
 }
 
 func (generator *Generator) responseAssembler(assemblerName string, interfaceResponseName string, responseName string) (results []jen.Code) {
-	//assembler struct
 	results = append(results, jen.Type().Id(assemblerName).Struct(jen.Id("response")))
 
-	// assembler.Build() — returns *responseName so the marker/inner()
-	// methods (pointer receivers) are present in the value's method set.
+	// Build returns *responseName so its pointer-receiver methods are part
+	// of the value's method set.
 	results = append(results, jen.Func().Params(
 		jen.Id("builder").Op("*").Id(assemblerName)).Id("Build").Params().Params(
 		jen.Id(interfaceResponseName)).Block(
@@ -3352,8 +3405,6 @@ func (generator *Generator) headersStruct(name string, headers map[string]*opena
 		return jen.Null()
 	}
 
-	// Sort keys for deterministic field/value ordering — map iteration order
-	// is non-deterministic otherwise.
 	entries := sortedMapEntries(headers)
 
 	headersCode := make([]jen.Code, 0, len(entries))

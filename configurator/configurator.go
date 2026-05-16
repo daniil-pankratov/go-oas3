@@ -53,13 +53,14 @@ type Configurator struct {
 	config *Config
 }
 
-// New wires the configurator with the supplied config holder. The config is
-// populated by LoadFlags() — call it before reading any field.
 func New(config *Config) *Configurator {
 	return &Configurator{config: config}
 }
 
 func (configurator *Configurator) concatPaths(filePath string) (string, error) {
+	if filePath == "" {
+		return "", nil
+	}
 	if filePath[0] == '.' {
 		wd, err := os.Getwd()
 		if err != nil {
@@ -72,9 +73,6 @@ func (configurator *Configurator) concatPaths(filePath string) (string, error) {
 	return filePath, nil
 }
 
-// LoadFlags parses CLI flags into the config holder and applies derived
-// defaults (component package/path fall back to the main package/path). Must
-// be called once before downstream code reads from Config.
 func (configurator *Configurator) LoadFlags() (err error) {
 	if err := confita.NewLoader(flags.NewBackend()).Load(context.Background(), configurator.config); err != nil {
 		return err
@@ -88,8 +86,14 @@ func (configurator *Configurator) LoadFlags() (err error) {
 		configurator.config.ComponentsPackage = configurator.config.Package
 	}
 
+	// ComponentsPath must go through the same cwd-prepending as Path:
+	// errVarsPackagesShared compares the two as strings, so a mismatch like
+	// "./out" vs "/cwd/out" splits the err-var declarations into both files
+	// and breaks compilation.
 	if configurator.config.ComponentsPath == "" {
 		configurator.config.ComponentsPath = configurator.config.Path
+	} else if configurator.config.ComponentsPath, err = configurator.concatPaths(configurator.config.ComponentsPath); err != nil {
+		return err
 	}
 
 	return nil

@@ -15,7 +15,10 @@ func (normalizer *Normalizer) decapitalize(str string) string {
 }
 
 func (normalizer *Normalizer) normalize(str string) string {
-	separators := "-#@!$&=.+:;_~ (){}[]"
+	// '/' is a separator so "application/json" → "ApplicationJson", matching
+	// what contentType() produces — diverging here breaks inline response
+	// type-name reconstruction in the generator.
+	separators := "-#@!$&=.+:;_~ (){}[]/"
 	s := strings.Trim(str, " ")
 
 	n := ""
@@ -61,10 +64,8 @@ func (normalizer *Normalizer) normalizeOperationName(path string, method string)
 	return normalizer.normalize(strings.ReplaceAll(strings.ToLower(method)+path, "/", "-"))
 }
 
-// isEmptyCode reports whether a generated code node is the no-op `jen.Null()`
-// or `jen.Line()` sentinel — used to skip them when interleaving blank lines.
-// reflect.DeepEqual on tiny jen.Statement values is acceptable here: this
-// runs only during code generation, not in any hot path of generated code.
+// isEmptyCode reports whether code is the no-op jen.Null() / jen.Line()
+// sentinel — used to skip them when interleaving blank lines.
 func isEmptyCode(code jen.Code) bool {
 	return reflect.DeepEqual(code, jen.Null()) || reflect.DeepEqual(code, jen.Line())
 }

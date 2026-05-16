@@ -215,6 +215,14 @@ func (typ *Type) fillGoType(into *jen.Statement, parentTypeName string, typeName
 
 			into.Map(keyCode)
 
+			// `additionalProperties: true|false` sets Has but leaves Schema nil
+			// — recursing into fillGoType with a nil schemaRef NPEs, so emit
+			// the open-ended `interface{}` value type for that shape instead.
+			if schema.AdditionalProperties.Schema == nil {
+				into.Interface()
+				return
+			}
+
 			typ.fillGoType(into, parentTypeName, typeName, schema.AdditionalProperties.Schema, false, false)
 
 			return

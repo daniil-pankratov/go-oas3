@@ -10,9 +10,19 @@ import (
 	"fmt"
 	chi "github.com/go-chi/chi/v5"
 	"net/http"
+	"reflect"
 	"strings"
 )
 
+// Hooks are observability callbacks fired by the generated routing layer.
+// Any field may be left nil — ensureHooks() at handler-init time fills the
+// nil entries with no-op stubs, so call sites never need to nil-check.
+//
+// Contract: hooks are for observability (logging, metrics, tracing). The
+// runtime owns the response. ResponseBodyMarshalFailed receives an
+// http.ResponseWriter for inspection only — the runtime calls http.Error
+// immediately after the hook returns, so writing to w from the hook will
+// produce a duplicate-WriteHeader warning. Read headers/r.Context() at most.
 type Hooks struct {
 	RequestSecurityParseFailed    func(*http.Request, string, RequestProcessingResult)
 	RequestSecurityParseCompleted func(*http.Request, string)
@@ -168,7 +178,15 @@ func extractSecurity(
 		if linkedChecksValid {
 			return results, true, nil
 		}
-		checkErr = attemptCheckErr
+		// Preserve the first real handle() error across OR-branches. A later
+		// branch that fails only on extract (isExtracted=false → attemptCheckErr
+		// stays nil) must NOT overwrite a real auth-handler error from an
+		// earlier branch — otherwise the caller misclassifies the failure as
+		// SecurityParseFailed ("no credentials") and loses the underlying
+		// error that RequestSecurityCheckFailed already reported.
+		if checkErr == nil {
+			checkErr = attemptCheckErr
+		}
 	}
 	return results, false, checkErr
 }
@@ -207,6 +225,22 @@ func (r RequestProcessingResult) Type() requestProcessingResultType {
 
 func (r RequestProcessingResult) Err() error {
 	return r.error
+}
+
+var (
+	_ = reflect.ValueOf
+)
+
+func isNilResponse(v responseInterface) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Chan, reflect.Func, reflect.Map, reflect.Slice:
+		return rv.IsNil()
+	}
+	return false
 }
 
 func WidgetsHandler(impl WidgetsService, r chi.Router, hooks *Hooks, securitySchemas SecuritySchemas) http.Handler {
@@ -278,6 +312,11 @@ func (router *widgetsRouter) parsePostClassicWidgetsRequest(r *http.Request) (re
 func (router *widgetsRouter) PostClassicWidgets(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	result := router.service.PostClassicWidgets(r.Context(), router.parsePostClassicWidgetsRequest(r))
+	if isNilResponse(result) {
+		router.hooks.ResponseBodyMarshalFailed(w, r, "PostClassicWidgets", errServiceReturnedANilResponse)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
 	respond(w, r, router.hooks, "PostClassicWidgets", result.inner(), true)
 }
 
@@ -313,6 +352,11 @@ func (router *widgetsRouter) parsePostWidgetsRequest(r *http.Request) (request P
 func (router *widgetsRouter) PostWidgets(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	result := router.service.PostWidgets(r.Context(), router.parsePostWidgetsRequest(r))
+	if result == nil {
+		router.hooks.ResponseBodyMarshalFailed(w, r, "PostWidgets", errServiceReturnedANilResponse)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
 	respond(w, r, router.hooks, "PostWidgets", &result.response, true)
 }
 
@@ -325,6 +369,11 @@ func (router *widgetsRouter) parseGetWidgetsEchoRequest(r *http.Request) (reques
 func (router *widgetsRouter) GetWidgetsEcho(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	result := router.service.GetWidgetsEcho(r.Context(), router.parseGetWidgetsEchoRequest(r))
+	if result == nil {
+		router.hooks.ResponseBodyMarshalFailed(w, r, "GetWidgetsEcho", errServiceReturnedANilResponse)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
 	respond(w, r, router.hooks, "GetWidgetsEcho", &result.response, true)
 }
 
@@ -337,6 +386,11 @@ func (router *widgetsRouter) parseGetWidgetsMultiRequest(r *http.Request) (reque
 func (router *widgetsRouter) GetWidgetsMulti(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	result := router.service.GetWidgetsMulti(r.Context(), router.parseGetWidgetsMultiRequest(r))
+	if result == nil {
+		router.hooks.ResponseBodyMarshalFailed(w, r, "GetWidgetsMulti", errServiceReturnedANilResponse)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
 	respond(w, r, router.hooks, "GetWidgetsMulti", &result.response, true)
 }
 
@@ -349,6 +403,11 @@ func (router *widgetsRouter) parseGetWidgetsRedirectRequest(r *http.Request) (re
 func (router *widgetsRouter) GetWidgetsRedirect(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	result := router.service.GetWidgetsRedirect(r.Context(), router.parseGetWidgetsRedirectRequest(r))
+	if result == nil {
+		router.hooks.ResponseBodyMarshalFailed(w, r, "GetWidgetsRedirect", errServiceReturnedANilResponse)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
 	respond(w, r, router.hooks, "GetWidgetsRedirect", &result.response, true)
 }
 
@@ -375,6 +434,11 @@ func (router *widgetsRouter) parseGetWidgetsSecureRequest(r *http.Request) (requ
 func (router *widgetsRouter) GetWidgetsSecure(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	result := router.service.GetWidgetsSecure(r.Context(), router.parseGetWidgetsSecureRequest(r))
+	if result == nil {
+		router.hooks.ResponseBodyMarshalFailed(w, r, "GetWidgetsSecure", errServiceReturnedANilResponse)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
 	respond(w, r, router.hooks, "GetWidgetsSecure", &result.response, true)
 }
 
@@ -397,6 +461,7 @@ var (
 	_ = json.Marshal
 	_ = errors.New
 	_ = fmt.Sprint
+	_ = reflect.ValueOf
 )
 
 func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, resp *response, hasContent bool) {
@@ -438,9 +503,19 @@ func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, 
 		case "application/xml":
 			body, err = xml.Marshal(resp.body)
 		case "application/octet-stream":
-			var ok bool
-			if body, ok = (resp.body).([]byte); !ok {
-				err = errors.New("body is not []byte")
+			// Fast path for []byte and its aliases (e.g. type X = []byte).
+			// Fall back to reflect for named types whose underlying type is
+			// []byte (type X []byte) — the plain type assertion above would
+			// fail those since Go checks type identity, not underlying type.
+			if b, ok := (resp.body).([]byte); ok {
+				body = b
+			} else {
+				rv := reflect.ValueOf(resp.body)
+				if rv.Kind() == reflect.Slice && rv.Type().Elem().Kind() == reflect.Uint8 {
+					body = rv.Bytes()
+				} else {
+					err = errors.New("body is not []byte")
+				}
 			}
 		case "text/html":
 			body = []byte(fmt.Sprint(resp.body))
@@ -717,10 +792,9 @@ func (r RequestMeta) GetSecurityCheckResults() map[SecurityScheme]string {
 	return r.SecurityCheckResults
 }
 
-// Request is implemented by every generated XxxRequest whose operation is
-// marked with x-go-generics. GetProcessingResult and GetSecurityCheckResults
-// are promoted from the embedded RequestMeta; GetHeader is emitted per
-// operation because the Header type is unique per endpoint.
+// Request is implemented by every x-go-generics XxxRequest. The first two
+// methods come from the embedded RequestMeta; GetHeader is per-operation
+// because Header is uniquely typed per endpoint.
 type Request interface {
 	GetProcessingResult() RequestProcessingResult
 	GetSecurityCheckResults() map[SecurityScheme]string
@@ -735,8 +809,8 @@ type ResponseBuilder[B any] struct {
 	response
 }
 
-// NewResponse creates a builder for a Response[B]. Content-type defaults to
-// "application/json"; override with ContentType() if needed.
+// NewResponse returns a builder with content-type defaulting to
+// "application/json"; override via ContentType.
 func NewResponse[B any]() *ResponseBuilder[B] {
 	return &ResponseBuilder[B]{response: response{contentType: "application/json"}}
 }
@@ -751,8 +825,7 @@ func (b *ResponseBuilder[B]) ContentType(ct string) *ResponseBuilder[B] {
 	return b
 }
 
-// Typed content-type shortcuts. Equivalent to ContentType("application/json")
-// etc. but read more naturally in fluent chains. Add more as needed.
+// Typed content-type shortcuts for fluent chains.
 func (b *ResponseBuilder[B]) ApplicationJson() *ResponseBuilder[B] {
 	b.response.contentType = "application/json"
 	return b

@@ -62,8 +62,6 @@ func main() {
 			os.Exit(0)
 		}
 	}
-	// Manual wiring — the dependency graph is small and static, so explicit
-	// constructors are easier to follow than reflection-driven DI.
 	cfg := new(configurator.Config).Defaults()
 	if err := configurator.New(cfg).LoadFlags(); err != nil {
 		log.Fatal(err.Error())
