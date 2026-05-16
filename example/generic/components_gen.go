@@ -11,7 +11,7 @@ import (
 var (
 	errCodeIsRequired              = errors.New("code is required")
 	errFailedPassingSecurityChecks = errors.New("failed passing security checks")
-	errIdIsRequired                = errors.New("id is required")
+	errIDIsRequired                = errors.New("id is required")
 	errMessageIsRequired           = errors.New("message is required")
 	errNameIsRequired              = errors.New("name is required")
 )
@@ -94,7 +94,7 @@ func (body *Widget) UnmarshalJSON(data []byte) error {
 	}
 
 	if value.ID == nil {
-		return errIdIsRequired
+		return errIDIsRequired
 	}
 
 	body.ID = *value.ID

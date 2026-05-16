@@ -317,7 +317,6 @@ func (router *widgetsRouter) PostWidgets(w http.ResponseWriter, r *http.Request)
 }
 
 func (router *widgetsRouter) parseGetWidgetsEchoRequest(r *http.Request) (request GetWidgetsEchoRequest) {
-
 	router.hooks.RequestParseCompleted(r, "GetWidgetsEcho")
 
 	return
@@ -330,7 +329,6 @@ func (router *widgetsRouter) GetWidgetsEcho(w http.ResponseWriter, r *http.Reque
 }
 
 func (router *widgetsRouter) parseGetWidgetsMultiRequest(r *http.Request) (request GetWidgetsMultiRequest) {
-
 	router.hooks.RequestParseCompleted(r, "GetWidgetsMulti")
 
 	return
@@ -343,7 +341,6 @@ func (router *widgetsRouter) GetWidgetsMulti(w http.ResponseWriter, r *http.Requ
 }
 
 func (router *widgetsRouter) parseGetWidgetsRedirectRequest(r *http.Request) (request GetWidgetsRedirectRequest) {
-
 	router.hooks.RequestParseCompleted(r, "GetWidgetsRedirect")
 
 	return
@@ -430,12 +427,10 @@ func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, 
 		return
 	}
 
-	if ct := resp.contentType; ct != "" {
-		w.Header().Set("Content-Type", ct)
-	}
-
-	w.WriteHeader(resp.statusCode)
-
+	// Marshal BEFORE writing the status code so a serialization failure can
+	// still surface as a clean 500 instead of a 2xx with a truncated body —
+	// once WriteHeader fires, headers/status are committed to the wire and
+	// we can no longer signal the error to the client.
 	var body []byte
 	if resp.body != nil {
 		var err error
@@ -456,12 +451,18 @@ func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, 
 		}
 		if err != nil {
 			hooks.ResponseBodyMarshalFailed(w, r, name, err)
+			http.Error(w, "internal server error", http.StatusInternalServerError)
 			return
 		}
 		hooks.ResponseBodyMarshalCompleted(r, name)
 	} else if len(resp.bodyRaw) > 0 {
 		body = resp.bodyRaw
 	}
+
+	if ct := resp.contentType; ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+	w.WriteHeader(resp.statusCode)
 
 	if len(body) > 0 {
 		count, err := w.Write(body)
@@ -729,12 +730,6 @@ type Request interface {
 type Response[B any] struct {
 	response
 }
-
-// inner satisfies responseInterface so generic-mode responses can be passed
-// to respond via a single-method indirection if ever needed. In practice the
-// per-operation wrapper accesses &result.response directly, bypassing the
-// interface for zero dispatch overhead.
-func (r *Response[B]) inner() *response { return &r.response }
 
 type ResponseBuilder[B any] struct {
 	response

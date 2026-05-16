@@ -124,7 +124,7 @@ func extractSecurity(
 	name string,
 	requirements [][]securityProcessor,
 	skipCheck bool,
-) (results map[SecurityScheme]string, passed bool) {
+) (results map[SecurityScheme]string, passed bool, checkErr error) {
 	if skipCheck {
 		for _, processors := range requirements {
 			for _, processor := range processors {
@@ -139,11 +139,12 @@ func extractSecurity(
 			}
 			break
 		}
-		return results, true
+		return results, true, nil
 	}
 
 	for _, processors := range requirements {
 		linkedChecksValid := true
+		attemptCheckErr := error(nil)
 		for _, processor := range processors {
 			schemeName, value, isExtracted := processor.extract(r)
 			if !isExtracted {
@@ -154,6 +155,7 @@ func extractSecurity(
 				hooks.RequestSecurityCheckFailed(r, name, string(processor.scheme),
 					RequestProcessingResult{error: err, typee: SecurityCheckFailed})
 				linkedChecksValid = false
+				attemptCheckErr = err
 				break
 			}
 			hooks.RequestSecurityCheckCompleted(r, name, string(processor.scheme))
@@ -163,10 +165,11 @@ func extractSecurity(
 			results[processor.scheme] = value
 		}
 		if linkedChecksValid {
-			return results, true
+			return results, true, nil
 		}
+		checkErr = attemptCheckErr
 	}
-	return results, false
+	return results, false, checkErr
 }
 
 type requestProcessingResultType uint8
@@ -309,12 +312,10 @@ func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, 
 		return
 	}
 
-	if ct := resp.contentType; ct != "" {
-		w.Header().Set("Content-Type", ct)
-	}
-
-	w.WriteHeader(resp.statusCode)
-
+	// Marshal BEFORE writing the status code so a serialization failure can
+	// still surface as a clean 500 instead of a 2xx with a truncated body —
+	// once WriteHeader fires, headers/status are committed to the wire and
+	// we can no longer signal the error to the client.
 	var body []byte
 	if resp.body != nil {
 		var err error
@@ -335,6 +336,7 @@ func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, 
 		}
 		if err != nil {
 			hooks.ResponseBodyMarshalFailed(w, r, name, err)
+			http.Error(w, "internal server error", http.StatusInternalServerError)
 			return
 		}
 		hooks.ResponseBodyMarshalCompleted(r, name)
@@ -342,11 +344,15 @@ func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, 
 		body = resp.bodyRaw
 	}
 
+	if ct := resp.contentType; ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+	w.WriteHeader(resp.statusCode)
+
 	if len(body) > 0 {
 		count, err := w.Write(body)
 		if err != nil {
 			hooks.ResponseBodyWriteFailed(r, name, count, err)
-			hooks.ResponseBodyWriteCompleted(r, name, count)
 			return
 		}
 		hooks.ResponseBodyWriteCompleted(r, name, count)

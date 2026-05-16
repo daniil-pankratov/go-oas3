@@ -84,10 +84,6 @@ func (configurator *Configurator) LoadFlags() (err error) {
 		return err
 	}
 
-	if configurator.config.Package, err = configurator.concatPaths(configurator.config.Path); err != nil {
-		return err
-	}
-
 	if configurator.config.ComponentsPackage == "" {
 		configurator.config.ComponentsPackage = configurator.config.Package
 	}

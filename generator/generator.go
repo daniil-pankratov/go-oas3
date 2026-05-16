@@ -51,14 +51,22 @@ func (generator *Generator) errVar(msg string, file errFile) string {
 	if name, ok := (*m)[msg]; ok {
 		return name
 	}
-	name := buildErrVarName(msg, len(*m))
+	base := buildErrVarName(msg, len(*m))
 	// Guard against name collisions across different messages that normalize
 	// to the same identifier (e.g. "x is required" vs "x_is_required").
+	// Loop with an incrementing suffix until we get an identifier no other
+	// entry already claims — a single check is not enough, the chosen suffix
+	// itself can collide with a previously-generated <name><digits> entry.
+	used := make(map[string]struct{}, len(*m))
 	for _, existing := range *m {
-		if existing == name {
-			name = fmt.Sprintf("%s%d", name, len(*m))
+		used[existing] = struct{}{}
+	}
+	name := base
+	for i := 1; ; i++ {
+		if _, taken := used[name]; !taken {
 			break
 		}
+		name = fmt.Sprintf("%s%d", base, i)
 	}
 	(*m)[msg] = name
 	return name
@@ -106,32 +114,53 @@ func (generator *Generator) errVarsBlock(file errFile) jen.Code {
 	return jen.Var().Defs(defs...).Line()
 }
 
+// commonInitialisms — words that should be all-caps when they appear as a
+// standalone word inside a Go identifier, per the Go style guide.
+var commonInitialisms = map[string]string{
+	"id":   "ID",
+	"uuid": "UUID",
+	"http": "HTTP",
+	"https": "HTTPS",
+	"url":  "URL",
+	"uri":  "URI",
+	"api":  "API",
+	"json": "JSON",
+	"xml":  "XML",
+	"html": "HTML",
+	"sql":  "SQL",
+	"ip":   "IP",
+}
+
 // buildErrVarName turns a free-form message into a Go identifier prefixed
 // with "err". Non-alphanumeric runes act as word separators; each following
-// word is title-cased. Falls back to errN if normalization yields nothing.
+// word is title-cased, with well-known initialisms (ID, UUID, HTTP, …)
+// emitted in all-caps. Falls back to errN if normalization yields nothing.
 func buildErrVarName(msg string, idx int) string {
 	var sb strings.Builder
 	sb.WriteString("err")
-	titleNext := true
+	var word strings.Builder
+	flush := func() {
+		if word.Len() == 0 {
+			return
+		}
+		w := word.String()
+		if up, ok := commonInitialisms[strings.ToLower(w)]; ok {
+			sb.WriteString(up)
+		} else {
+			sb.WriteString(strings.ToUpper(w[:1]))
+			sb.WriteString(w[1:])
+		}
+		word.Reset()
+	}
 	for _, r := range msg {
 		switch {
-		case r >= 'a' && r <= 'z':
-			if titleNext {
-				sb.WriteRune(r - 32)
-				titleNext = false
-			} else {
-				sb.WriteRune(r)
-			}
-		case r >= 'A' && r <= 'Z':
-			sb.WriteRune(r)
-			titleNext = false
-		case r >= '0' && r <= '9':
-			sb.WriteRune(r)
-			titleNext = false
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			word.WriteRune(r)
 		default:
-			titleNext = true
+			flush()
 		}
 	}
+	flush()
 	if sb.Len() == 3 {
 		return fmt.Sprintf("err%d", idx)
 	}
@@ -2344,12 +2373,24 @@ func (generator *Generator) wrapperRequestParser(name string, requestName string
 		funcCode = append(funcCode, jen.Id("query").Op(":=").Id("r").Dot("URL").Dot("Query").Call())
 	}
 
-	funcCode = append(funcCode, generator.wrapperSecurity(name, operation))
-	funcCode = append(funcCode, generator.wrapperRequestParsers(name, operation)...)
-	funcCode = append(funcCode, generator.wrapperBody(method, path, contentType, name, operation, requestBody)) //TODO: support different content-types
-	funcCode = append(funcCode, jen.Line().Add(generator.hookCall("RequestParseCompleted",
-		jen.Id("r"),
-		jen.Lit(name))))
+	security := generator.wrapperSecurity(name, operation)
+	parsers := generator.wrapperRequestParsers(name, operation)
+	body := generator.wrapperBody(method, path, contentType, name, operation, requestBody)
+
+	funcCode = append(funcCode, security)
+	funcCode = append(funcCode, parsers...)
+	funcCode = append(funcCode, body)
+
+	// Leading blank line before RequestParseCompleted only when something
+	// substantive came before it — otherwise we'd open the function body
+	// with an awkward empty line.
+	hasPriorContent := hasQueryParam || !isEmptyCode(security) || len(parsers) > 0 || !isEmptyCode(body)
+	hookStmt := generator.hookCall("RequestParseCompleted", jen.Id("r"), jen.Lit(name))
+	if hasPriorContent {
+		funcCode = append(funcCode, jen.Line().Add(hookStmt))
+	} else {
+		funcCode = append(funcCode, hookStmt)
+	}
 	funcCode = append(funcCode, jen.Line().Return())
 
 	return jen.Func().Params(
@@ -2468,12 +2509,10 @@ func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, 
 		return
 	}
 
-	if ct := resp.contentType; ct != "" {
-		w.Header().Set("Content-Type", ct)
-	}
-
-	w.WriteHeader(resp.statusCode)
-
+	// Marshal BEFORE writing the status code so a serialization failure can
+	// still surface as a clean 500 instead of a 2xx with a truncated body —
+	// once WriteHeader fires, headers/status are committed to the wire and
+	// we can no longer signal the error to the client.
 	var body []byte
 	if resp.body != nil {
 		var err error
@@ -2494,12 +2533,18 @@ func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, 
 		}
 		if err != nil {
 			hooks.ResponseBodyMarshalFailed(w, r, name, err)
+			http.Error(w, "internal server error", http.StatusInternalServerError)
 			return
 		}
 		hooks.ResponseBodyMarshalCompleted(r, name)
 	} else if len(resp.bodyRaw) > 0 {
 		body = resp.bodyRaw
 	}
+
+	if ct := resp.contentType; ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+	w.WriteHeader(resp.statusCode)
 
 	if len(body) > 0 {
 		count, err := w.Write(body)
@@ -2808,12 +2853,6 @@ func (generator *Generator) responseStruct() jen.Code {
 			jen.Id("inner").Params().Op("*").Id("response")))
 }
 
-func (generator *Generator) responseInterface(name string) jen.Code {
-	name = generator.normalizer.decapitalize(name)
-
-	return jen.Type().Id(name + "Response").Interface(jen.Id(name + "Response").Params())
-}
-
 // genericResponseTypes emits the generic Response[B] / ResponseBuilder[B]
 // types plus the Request interface and RequestMeta struct embedded by every
 // generic XxxRequest. Emitted once per package.
@@ -2845,12 +2884,6 @@ type Request interface {
 type Response[B any] struct {
 	response
 }
-
-// inner satisfies responseInterface so generic-mode responses can be passed
-// to respond via a single-method indirection if ever needed. In practice the
-// per-operation wrapper accesses &result.response directly, bypassing the
-// interface for zero dispatch overhead.
-func (r *Response[B]) inner() *response { return &r.response }
 
 type ResponseBuilder[B any] struct {
 	response

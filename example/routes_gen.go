@@ -133,7 +133,7 @@ func extractSecurity(
 	name string,
 	requirements [][]securityProcessor,
 	skipCheck bool,
-) (results map[SecurityScheme]string, passed bool) {
+) (results map[SecurityScheme]string, passed bool, checkErr error) {
 	if skipCheck {
 		for _, processors := range requirements {
 			for _, processor := range processors {
@@ -148,11 +148,12 @@ func extractSecurity(
 			}
 			break
 		}
-		return results, true
+		return results, true, nil
 	}
 
 	for _, processors := range requirements {
 		linkedChecksValid := true
+		attemptCheckErr := error(nil)
 		for _, processor := range processors {
 			schemeName, value, isExtracted := processor.extract(r)
 			if !isExtracted {
@@ -163,6 +164,7 @@ func extractSecurity(
 				hooks.RequestSecurityCheckFailed(r, name, string(processor.scheme),
 					RequestProcessingResult{error: err, typee: SecurityCheckFailed})
 				linkedChecksValid = false
+				attemptCheckErr = err
 				break
 			}
 			hooks.RequestSecurityCheckCompleted(r, name, string(processor.scheme))
@@ -172,10 +174,11 @@ func extractSecurity(
 			results[processor.scheme] = value
 		}
 		if linkedChecksValid {
-			return results, true
+			return results, true, nil
 		}
+		checkErr = attemptCheckErr
 	}
-	return results, false
+	return results, false, checkErr
 }
 
 type requestProcessingResultType uint8
@@ -261,11 +264,14 @@ func (router *authRouter) mount() {
 
 func (router *authRouter) parsePostBearerEndpointRequest(r *http.Request) (request PostBearerEndpointRequest) {
 
-	results, passed := extractSecurity(r, router.hooks, "PostBearerEndpoint", router.postBearerEndpointSecurityReqs, false)
+	results, passed, checkErr := extractSecurity(r, router.hooks, "PostBearerEndpoint", router.postBearerEndpointSecurityReqs, false)
 	request.SecurityCheckResults = results
 	if !passed {
-		err := errFailedPassingSecurityChecks
-		request.ProcessingResult = RequestProcessingResult{error: err, typee: SecurityParseFailed}
+		if checkErr != nil {
+			request.ProcessingResult = RequestProcessingResult{error: checkErr, typee: SecurityCheckFailed}
+			return
+		}
+		request.ProcessingResult = RequestProcessingResult{error: errFailedPassingSecurityChecks, typee: SecurityParseFailed}
 		router.hooks.RequestSecurityParseFailed(r, "PostBearerEndpoint", request.ProcessingResult)
 		return
 	}
@@ -284,11 +290,14 @@ func (router *authRouter) PostBearerEndpoint(w http.ResponseWriter, r *http.Requ
 
 func (router *authRouter) parseGetSecureEndpointRequest(r *http.Request) (request GetSecureEndpointRequest) {
 
-	results, passed := extractSecurity(r, router.hooks, "GetSecureEndpoint", router.getSecureEndpointSecurityReqs, false)
+	results, passed, checkErr := extractSecurity(r, router.hooks, "GetSecureEndpoint", router.getSecureEndpointSecurityReqs, false)
 	request.SecurityCheckResults = results
 	if !passed {
-		err := errFailedPassingSecurityChecks
-		request.ProcessingResult = RequestProcessingResult{error: err, typee: SecurityParseFailed}
+		if checkErr != nil {
+			request.ProcessingResult = RequestProcessingResult{error: checkErr, typee: SecurityCheckFailed}
+			return
+		}
+		request.ProcessingResult = RequestProcessingResult{error: errFailedPassingSecurityChecks, typee: SecurityParseFailed}
 		router.hooks.RequestSecurityParseFailed(r, "GetSecureEndpoint", request.ProcessingResult)
 		return
 	}
@@ -307,11 +316,14 @@ func (router *authRouter) GetSecureEndpoint(w http.ResponseWriter, r *http.Reque
 
 func (router *authRouter) parseGetSemiSecureEndpointRequest(r *http.Request) (request GetSemiSecureEndpointRequest) {
 
-	results, passed := extractSecurity(r, router.hooks, "GetSemiSecureEndpoint", router.getSemiSecureEndpointSecurityReqs, true)
+	results, passed, checkErr := extractSecurity(r, router.hooks, "GetSemiSecureEndpoint", router.getSemiSecureEndpointSecurityReqs, true)
 	request.SecurityCheckResults = results
 	if !passed {
-		err := errFailedPassingSecurityChecks
-		request.ProcessingResult = RequestProcessingResult{error: err, typee: SecurityParseFailed}
+		if checkErr != nil {
+			request.ProcessingResult = RequestProcessingResult{error: checkErr, typee: SecurityCheckFailed}
+			return
+		}
+		request.ProcessingResult = RequestProcessingResult{error: errFailedPassingSecurityChecks, typee: SecurityParseFailed}
 		router.hooks.RequestSecurityParseFailed(r, "GetSemiSecureEndpoint", request.ProcessingResult)
 		return
 	}
@@ -363,11 +375,14 @@ func (router *callbacksRouter) mount() {
 func (router *callbacksRouter) parsePostCallbacksCallbackTypeRequest(r *http.Request) (request PostCallbacksCallbackTypeRequest) {
 	query := r.URL.Query()
 
-	results, passed := extractSecurity(r, router.hooks, "PostCallbacksCallbackType", router.postCallbacksCallbackTypeSecurityReqs, false)
+	results, passed, checkErr := extractSecurity(r, router.hooks, "PostCallbacksCallbackType", router.postCallbacksCallbackTypeSecurityReqs, false)
 	request.SecurityCheckResults = results
 	if !passed {
-		err := errFailedPassingSecurityChecks
-		request.ProcessingResult = RequestProcessingResult{error: err, typee: SecurityParseFailed}
+		if checkErr != nil {
+			request.ProcessingResult = RequestProcessingResult{error: checkErr, typee: SecurityCheckFailed}
+			return
+		}
+		request.ProcessingResult = RequestProcessingResult{error: errFailedPassingSecurityChecks, typee: SecurityParseFailed}
 		router.hooks.RequestSecurityParseFailed(r, "PostCallbacksCallbackType", request.ProcessingResult)
 		return
 	}
@@ -623,11 +638,14 @@ func (router *transactionsRouter) PutTransaction(w http.ResponseWriter, r *http.
 func (router *transactionsRouter) parseDeleteTransactionsUUIDRequest(r *http.Request) (request DeleteTransactionsUUIDRequest) {
 	query := r.URL.Query()
 
-	results, passed := extractSecurity(r, router.hooks, "DeleteTransactionsUUID", router.deleteTransactionsUUIDSecurityReqs, false)
+	results, passed, checkErr := extractSecurity(r, router.hooks, "DeleteTransactionsUUID", router.deleteTransactionsUUIDSecurityReqs, false)
 	request.SecurityCheckResults = results
 	if !passed {
-		err := errFailedPassingSecurityChecks
-		request.ProcessingResult = RequestProcessingResult{error: err, typee: SecurityParseFailed}
+		if checkErr != nil {
+			request.ProcessingResult = RequestProcessingResult{error: checkErr, typee: SecurityCheckFailed}
+			return
+		}
+		request.ProcessingResult = RequestProcessingResult{error: errFailedPassingSecurityChecks, typee: SecurityParseFailed}
 		router.hooks.RequestSecurityParseFailed(r, "DeleteTransactionsUUID", request.ProcessingResult)
 		return
 	}
@@ -668,7 +686,7 @@ func (router *transactionsRouter) parseDeleteTransactionsUUIDRequest(r *http.Req
 
 	pathUUID := chi.URLParam(r, "uuid")
 	if pathUUID == "" {
-		err := errUuidIsEmpty
+		err := errUUIDIsEmpty
 
 		request.ProcessingResult = RequestProcessingResult{error: err, typee: PathParseFailed}
 		router.hooks.RequestPathParseFailed(r, "DeleteTransactionsUUID", "uuid", request.ProcessingResult)
@@ -689,7 +707,7 @@ func (router *transactionsRouter) parseDeleteTransactionsUUIDRequest(r *http.Req
 	}
 
 	if !regexParamRegex.MatchString(pathRegexParam) {
-		err := errRegexParamNotMatchedByTheDRegex10
+		err := errRegexParamNotMatchedByTheDRegex1
 
 		request.ProcessingResult = RequestProcessingResult{error: err, typee: PathParseFailed}
 		router.hooks.RequestPathParseFailed(r, "DeleteTransactionsUUID", "regexParam", request.ProcessingResult)
@@ -790,12 +808,10 @@ func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, 
 		return
 	}
 
-	if ct := resp.contentType; ct != "" {
-		w.Header().Set("Content-Type", ct)
-	}
-
-	w.WriteHeader(resp.statusCode)
-
+	// Marshal BEFORE writing the status code so a serialization failure can
+	// still surface as a clean 500 instead of a 2xx with a truncated body —
+	// once WriteHeader fires, headers/status are committed to the wire and
+	// we can no longer signal the error to the client.
 	var body []byte
 	if resp.body != nil {
 		var err error
@@ -816,6 +832,7 @@ func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, 
 		}
 		if err != nil {
 			hooks.ResponseBodyMarshalFailed(w, r, name, err)
+			http.Error(w, "internal server error", http.StatusInternalServerError)
 			return
 		}
 		hooks.ResponseBodyMarshalCompleted(r, name)
@@ -823,11 +840,15 @@ func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, 
 		body = resp.bodyRaw
 	}
 
+	if ct := resp.contentType; ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+	w.WriteHeader(resp.statusCode)
+
 	if len(body) > 0 {
 		count, err := w.Write(body)
 		if err != nil {
 			hooks.ResponseBodyWriteFailed(r, name, count, err)
-			hooks.ResponseBodyWriteCompleted(r, name, count)
 			return
 		}
 		hooks.ResponseBodyWriteCompleted(r, name, count)

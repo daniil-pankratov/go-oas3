@@ -1,6 +1,7 @@
 package generator
 
 import (
+	"reflect"
 	"strings"
 	"unicode"
 
@@ -62,18 +63,10 @@ func (normalizer *Normalizer) normalizeOperationName(path string, method string)
 
 // isEmptyCode reports whether a generated code node is the no-op `jen.Null()`
 // or `jen.Line()` sentinel — used to skip them when interleaving blank lines.
-// Identity comparison on the rendered statement is exact and avoids the
-// reflect.DeepEqual hit per element.
+// reflect.DeepEqual on tiny jen.Statement values is acceptable here: this
+// runs only during code generation, not in any hot path of generated code.
 func isEmptyCode(code jen.Code) bool {
-	stmt, ok := code.(*jen.Statement)
-	if !ok {
-		return false
-	}
-	// jen.Null() and jen.Line() each construct a *jen.Statement, but in
-	// practice we receive shared instances from the helpers below — compare
-	// the rendered token sequence length: Null() renders empty, Line() one
-	// newline. Both have a small fixed shape distinguishable by length 0/1.
-	return stmt == nil || len(*stmt) == 0
+	return reflect.DeepEqual(code, jen.Null()) || reflect.DeepEqual(code, jen.Line())
 }
 
 func (normalizer *Normalizer) doubleLineAfterEachElement(from ...jen.Code) []jen.Code {
