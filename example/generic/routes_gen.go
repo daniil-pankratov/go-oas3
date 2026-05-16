@@ -125,7 +125,7 @@ func extractSecurity(
 	name string,
 	requirements [][]securityProcessor,
 	skipCheck bool,
-) (results map[SecurityScheme]string, passed bool) {
+) (results map[SecurityScheme]string, passed bool, checkErr error) {
 	if skipCheck {
 		for _, processors := range requirements {
 			for _, processor := range processors {
@@ -140,11 +140,12 @@ func extractSecurity(
 			}
 			break
 		}
-		return results, true
+		return results, true, nil
 	}
 
 	for _, processors := range requirements {
 		linkedChecksValid := true
+		attemptCheckErr := error(nil)
 		for _, processor := range processors {
 			schemeName, value, isExtracted := processor.extract(r)
 			if !isExtracted {
@@ -155,6 +156,7 @@ func extractSecurity(
 				hooks.RequestSecurityCheckFailed(r, name, string(processor.scheme),
 					RequestProcessingResult{error: err, typee: SecurityCheckFailed})
 				linkedChecksValid = false
+				attemptCheckErr = err
 				break
 			}
 			hooks.RequestSecurityCheckCompleted(r, name, string(processor.scheme))
@@ -164,10 +166,11 @@ func extractSecurity(
 			results[processor.scheme] = value
 		}
 		if linkedChecksValid {
-			return results, true
+			return results, true, nil
 		}
+		checkErr = attemptCheckErr
 	}
-	return results, false
+	return results, false, checkErr
 }
 
 type requestProcessingResultType uint8
@@ -354,11 +357,14 @@ func (router *widgetsRouter) GetWidgetsRedirect(w http.ResponseWriter, r *http.R
 
 func (router *widgetsRouter) parseGetWidgetsSecureRequest(r *http.Request) (request GetWidgetsSecureRequest) {
 
-	results, passed := extractSecurity(r, router.hooks, "GetWidgetsSecure", router.getWidgetsSecureSecurityReqs, false)
+	results, passed, checkErr := extractSecurity(r, router.hooks, "GetWidgetsSecure", router.getWidgetsSecureSecurityReqs, false)
 	request.SecurityCheckResults = results
 	if !passed {
-		err := errFailedPassingSecurityChecks
-		request.ProcessingResult = RequestProcessingResult{error: err, typee: SecurityParseFailed}
+		if checkErr != nil {
+			request.ProcessingResult = RequestProcessingResult{error: checkErr, typee: SecurityCheckFailed}
+			return
+		}
+		request.ProcessingResult = RequestProcessingResult{error: errFailedPassingSecurityChecks, typee: SecurityParseFailed}
 		router.hooks.RequestSecurityParseFailed(r, "GetWidgetsSecure", request.ProcessingResult)
 		return
 	}
@@ -461,7 +467,6 @@ func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, 
 		count, err := w.Write(body)
 		if err != nil {
 			hooks.ResponseBodyWriteFailed(r, name, count, err)
-			hooks.ResponseBodyWriteCompleted(r, name, count)
 			return
 		}
 		hooks.ResponseBodyWriteCompleted(r, name, count)

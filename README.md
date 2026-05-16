@@ -74,7 +74,7 @@ paths:
 | `-authorization` | string | Headers for remote swagger files (`key1:value1,key2:value2`) | - |
 | `-prioritize-x-go-type` | bool | Prioritize `x-go-type` over schema properties | `false` |
 | `-pass-raw-request` | bool | Pass raw HTTP request to handler functions | `false` |
-| `-default-generics` | bool | Generate every operation in generic mode by default (see [Generic Response Mode](#generic-response-mode)). Can be overridden per-operation with `x-go-generics`. | `false` |
+| `-default-generics` | bool | Generate every operation in generic mode by default (see [Generic Response Mode](#generic-response-mode)); can be overridden per-operation with `x-go-generics`. | `false` |
 
 ### Examples
 

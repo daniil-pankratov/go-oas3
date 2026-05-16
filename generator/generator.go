@@ -1467,6 +1467,16 @@ func (generator *Generator) wrappers(swagger *openapi3.T) jen.Code {
 
 // extractSecurityFunc emits the one-time `extractSecurity` helper that walks
 // the OR-of-AND security requirements matrix for an operation.
+//
+// Return value distinguishes the failure mode so the caller can avoid
+// double-firing hooks:
+//   - passed=true             → at least one OR-branch satisfied; results set.
+//   - passed=false, checkErr non-nil → the final attempt's processor.handle()
+//     returned an error. RequestSecurityCheckFailed has already been fired by
+//     this function with the original error; the caller must NOT fire
+//     RequestSecurityParseFailed for the same event.
+//   - passed=false, checkErr nil → no requirement could be extracted (missing
+//     credentials). Caller fires RequestSecurityParseFailed.
 func (generator *Generator) extractSecurityFunc() jen.Code {
 	const src = `
 func extractSecurity(
@@ -1475,7 +1485,7 @@ func extractSecurity(
 	name string,
 	requirements [][]securityProcessor,
 	skipCheck bool,
-) (results map[SecurityScheme]string, passed bool) {
+) (results map[SecurityScheme]string, passed bool, checkErr error) {
 	if skipCheck {
 		for _, processors := range requirements {
 			for _, processor := range processors {
@@ -1490,11 +1500,12 @@ func extractSecurity(
 			}
 			break
 		}
-		return results, true
+		return results, true, nil
 	}
 
 	for _, processors := range requirements {
 		linkedChecksValid := true
+		attemptCheckErr := error(nil)
 		for _, processor := range processors {
 			schemeName, value, isExtracted := processor.extract(r)
 			if !isExtracted {
@@ -1505,6 +1516,7 @@ func extractSecurity(
 				hooks.RequestSecurityCheckFailed(r, name, string(processor.scheme),
 					RequestProcessingResult{error: err, typee: SecurityCheckFailed})
 				linkedChecksValid = false
+				attemptCheckErr = err
 				break
 			}
 			hooks.RequestSecurityCheckCompleted(r, name, string(processor.scheme))
@@ -1514,10 +1526,11 @@ func extractSecurity(
 			results[processor.scheme] = value
 		}
 		if linkedChecksValid {
-			return results, true
+			return results, true, nil
 		}
+		checkErr = attemptCheckErr
 	}
-	return results, false
+	return results, false, checkErr
 }
 `
 	return jen.Op(src)
@@ -2268,9 +2281,15 @@ func (generator *Generator) wrapperSecurity(name string, operation *openapi3.Ope
 	// ~80 lines of inlined loop boilerplate per operation with security.
 	securityFailedErr := generator.errVar("failed passing security checks", errFileRoutes)
 
+	// extractSecurity now returns (results, passed, checkErr). When checkErr
+	// is non-nil the inner processor.handle() failed and RequestSecurityCheckFailed
+	// was already fired with the original error — we propagate that error into
+	// ProcessingResult with SecurityCheckFailed type and skip firing
+	// RequestSecurityParseFailed (which would double-report). When checkErr is
+	// nil and !passed, no extractor matched — fire RequestSecurityParseFailed.
 	return jen.Null().
 		Add(jen.Line()).
-		Add(jen.List(jen.Id("results"), jen.Id("passed")).Op(":=").
+		Add(jen.List(jen.Id("results"), jen.Id("passed"), jen.Id("checkErr")).Op(":=").
 			Id("extractSecurity").Call(
 			jen.Id("r"),
 			jen.Id("router").Dot("hooks"),
@@ -2282,9 +2301,15 @@ func (generator *Generator) wrapperSecurity(name string, operation *openapi3.Ope
 		Add(jen.Id("request").Dot("SecurityCheckResults").Op("=").Id("results")).
 		Add(jen.Line()).
 		Add(jen.If(jen.Op("!").Id("passed")).Block(
-			jen.Id("err").Op(":=").Id(securityFailedErr),
+			jen.If(jen.Id("checkErr").Op("!=").Nil()).Block(
+				jen.Id("request").Dot("ProcessingResult").Op("=").Id("RequestProcessingResult").Values(
+					jen.Id("error").Op(":").Id("checkErr"),
+					jen.Id("typee").Op(":").Id("SecurityCheckFailed"),
+				),
+				jen.Return(),
+			),
 			jen.Id("request").Dot("ProcessingResult").Op("=").Id("RequestProcessingResult").Values(
-				jen.Id("error").Op(":").Id("err"),
+				jen.Id("error").Op(":").Id(securityFailedErr),
 				jen.Id("typee").Op(":").Id("SecurityParseFailed"),
 			),
 			generator.hookCall("RequestSecurityParseFailed",
@@ -2365,11 +2390,15 @@ func (generator *Generator) genericResponseBodyTypeName(op *openapi3.Operation, 
 	}
 	preferred := []string{"200", "201", "202", "204"}
 	statusOrder := append([]string{}, preferred...)
+	var extras []string
 	for status := range op.Responses.Map() {
 		if !slices.Contains(preferred, status) && strings.HasPrefix(status, "2") {
-			statusOrder = append(statusOrder, status)
+			extras = append(extras, status)
 		}
 	}
+	// Sort extras for deterministic codegen — map iteration is not stable.
+	slices.Sort(extras)
+	statusOrder = append(statusOrder, extras...)
 	for _, status := range statusOrder {
 		respRef := op.Responses.Map()[status]
 		if respRef == nil || respRef.Value == nil {
@@ -2476,7 +2505,6 @@ func respond(w http.ResponseWriter, r *http.Request, hooks *Hooks, name string, 
 		count, err := w.Write(body)
 		if err != nil {
 			hooks.ResponseBodyWriteFailed(r, name, count, err)
-			hooks.ResponseBodyWriteCompleted(r, name, count)
 			return
 		}
 		hooks.ResponseBodyWriteCompleted(r, name, count)
@@ -2711,7 +2739,9 @@ func (generator *Generator) serviceReturnType(op *openapi3.Operation, name strin
 	if body == "any" {
 		return jen.Op("*").Id("Response").Index(jen.Any())
 	}
-	return jen.Op("*").Id("Response").Index(jen.Id(body))
+	// Body lives in the components package; Qual emits the proper import
+	// alias when -componentsPackage differs from the router package.
+	return jen.Op("*").Id("Response").Index(jen.Qual(generator.config.ComponentsPackage, body))
 }
 
 func (generator *Generator) handlersInterfaces(swagger *openapi3.T) jen.Code {

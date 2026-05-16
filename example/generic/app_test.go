@@ -176,7 +176,9 @@ func TestGenericMultipleContentTypes(t *testing.T) {
 		t.Fatalf("content-type = %q, want application/xml", got)
 	}
 	// XML body should contain the field as XML element, not JSON.
-	if !bytes.Contains(body, []byte("<Widget>")) && !bytes.Contains(body, []byte("<id>")) {
+	// Note: encoding/xml uses the Go field name (`ID`), not the json tag,
+	// so the inner element is `<ID>` rather than `<id>`.
+	if !bytes.Contains(body, []byte("<Widget>")) || !bytes.Contains(body, []byte("<ID>")) {
 		t.Fatalf("body does not look like XML: %s", body)
 	}
 }
