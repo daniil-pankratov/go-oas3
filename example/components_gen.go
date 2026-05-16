@@ -162,28 +162,6 @@ func (body *UpdateTransactionRequest) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-type postBearerEndpointApplicationjson struct {
-	Message string `json:"message"`
-}
-
-type PostBearerEndpointApplicationjson struct {
-	Message string `json:"message"`
-}
-
-func (body *PostBearerEndpointApplicationjson) UnmarshalJSON(data []byte) error {
-	var value postBearerEndpointApplicationjson
-	if err := json.Unmarshal(data, &value); err != nil {
-		return err
-	}
-
-	body.Message = value.Message
-
-	return nil
-}
-func (body PostBearerEndpointApplicationjson) Validate() error {
-	return nil
-}
-
 type getSecureEndpointApplicationjson struct {
 	Message string `json:"message"`
 }
@@ -228,6 +206,28 @@ func (body *GetSemiSecureEndpointApplicationjson) UnmarshalJSON(data []byte) err
 	return nil
 }
 func (body GetSemiSecureEndpointApplicationjson) Validate() error {
+	return nil
+}
+
+type postBearerEndpointApplicationjson struct {
+	Message string `json:"message"`
+}
+
+type PostBearerEndpointApplicationjson struct {
+	Message string `json:"message"`
+}
+
+func (body *PostBearerEndpointApplicationjson) UnmarshalJSON(data []byte) error {
+	var value postBearerEndpointApplicationjson
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+
+	body.Message = value.Message
+
+	return nil
+}
+func (body PostBearerEndpointApplicationjson) Validate() error {
 	return nil
 }
 
