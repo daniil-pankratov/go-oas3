@@ -199,7 +199,14 @@ func (typ *Type) fillGoType(into *jen.Statement, parentTypeName string, typeName
 			return
 		}
 
-		if schema.AdditionalProperties.Has != nil || schema.AdditionalProperties.Schema != nil {
+		// Open map only when the spec says so: a typed `additionalProperties`
+		// schema, or `additionalProperties: true`. `additionalProperties:
+		// false` keeps the closed-struct path below — emitting a map for
+		// `false` would silently turn declared-shape objects into open-ended
+		// maps, the opposite of what the spec demands.
+		hasOpenMap := schema.AdditionalProperties.Schema != nil ||
+			(schema.AdditionalProperties.Has != nil && *schema.AdditionalProperties.Has)
+		if hasOpenMap {
 			keyCode := jen.Null()
 
 			keyPkg, keyValue, ok := typ.getXGoType(schemaRef.Value)
@@ -215,9 +222,8 @@ func (typ *Type) fillGoType(into *jen.Statement, parentTypeName string, typeName
 
 			into.Map(keyCode)
 
-			// `additionalProperties: true|false` sets Has but leaves Schema nil
-			// — recursing into fillGoType with a nil schemaRef NPEs, so emit
-			// the open-ended `interface{}` value type for that shape instead.
+			// `additionalProperties: true` leaves Schema nil — recursing
+			// into fillGoType with nil NPEs, so emit `interface{}` here.
 			if schema.AdditionalProperties.Schema == nil {
 				into.Interface()
 				return

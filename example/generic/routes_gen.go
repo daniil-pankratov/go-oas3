@@ -137,6 +137,8 @@ func extractSecurity(
 	skipCheck bool,
 ) (results map[SecurityScheme]string, passed bool, checkErr error) {
 	if skipCheck {
+		// Expose every extractable credential across all OR-branches so the
+		// handler can decide. Validation is skipped by contract.
 		for _, processors := range requirements {
 			for _, processor := range processors {
 				_, value, isExtracted := processor.extract(r)
@@ -148,12 +150,14 @@ func extractSecurity(
 				}
 				results[processor.scheme] = value
 			}
-			break
 		}
 		return results, true, nil
 	}
 
 	for _, processors := range requirements {
+		// Per-branch buffer: a partially-extracted branch must not leak its
+		// credentials into the final results.
+		branchResults := map[SecurityScheme]string{}
 		linkedChecksValid := true
 		attemptCheckErr := error(nil)
 		for _, processor := range processors {
@@ -170,20 +174,17 @@ func extractSecurity(
 				break
 			}
 			hooks.RequestSecurityCheckCompleted(r, name, string(processor.scheme))
-			if results == nil {
-				results = map[SecurityScheme]string{}
-			}
-			results[processor.scheme] = value
+			branchResults[processor.scheme] = value
 		}
 		if linkedChecksValid {
+			if len(branchResults) > 0 {
+				results = branchResults
+			}
 			return results, true, nil
 		}
 		// Preserve the first real handle() error across OR-branches. A later
-		// branch that fails only on extract (isExtracted=false → attemptCheckErr
-		// stays nil) must NOT overwrite a real auth-handler error from an
-		// earlier branch — otherwise the caller misclassifies the failure as
-		// SecurityParseFailed ("no credentials") and loses the underlying
-		// error that RequestSecurityCheckFailed already reported.
+		// branch that fails only on extract (attemptCheckErr stays nil) must
+		// NOT overwrite a real auth-handler error from an earlier branch.
 		if checkErr == nil {
 			checkErr = attemptCheckErr
 		}

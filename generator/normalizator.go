@@ -105,7 +105,12 @@ func (normalizer *Normalizer) contentType(str string) string {
 		return ""
 	}
 
-	split := func(r rune) bool { return r == '/' || r == '-' }
+	// Treat every non-alphanumeric rune as a word boundary so structured
+	// MIME suffixes (application/problem+json, application/vnd.api+json)
+	// produce valid Go identifiers instead of leaking `+`/`.` into the name.
+	split := func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'))
+	}
 	var sb strings.Builder
 	for _, part := range strings.FieldsFunc(str, split) {
 		sb.WriteString(strings.Title(part))
